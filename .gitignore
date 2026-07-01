@@ -1,0 +1,30 @@
+# Secrets and local operator files
+.env
+*.key
+*.pem
+*.p12
+*.pfx
+id_rsa*
+id_ed25519*
+*password*
+*secret*
+
+# WireGuard/private runtime exports
+*.conf.local
+wg-*.conf
+*-B.conf
+
+# Logs and temporary files
+*.log
+*.tmp
+*.bak
+*.backup
+*.swp
+*.swo
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
