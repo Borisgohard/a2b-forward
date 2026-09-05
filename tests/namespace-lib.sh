@@ -34,8 +34,12 @@ systemctl() {
         is-active)
             if [[ "$unit" == a2b-forward-proxy.service && -f "$PROXY_PID" ]]; then
                 read -r pid < "$PROXY_PID"
-                kill -0 "$pid" 2>/dev/null && return 0
+                if kill -0 "$pid" 2>/dev/null; then
+                    [[ " $* " == *" --quiet "* ]] || echo active
+                    return 0
+                fi
             fi
+            [[ " $* " == *" --quiet "* ]] || echo inactive
             return 1 ;;
         enable)
             if [[ " $* " == *" --now "* ]]; then
