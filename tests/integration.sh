@@ -109,6 +109,12 @@ udp 10.203.1.2 18080
 udp fd00:a2b:1::2 18080
 pass 'NAT44/NAT66 TCP and multi-datagram UDP with return-path SNAT'
 
+# 从主菜单走完新手路径，包含默认网卡选择、目标 socket 解析、探测和最终确认。
+printf '%s\n' 1 1 y 1 1 3 1 18086 10.203.2.2:18081 '' '' '' '' 10.203.0.2/32 y |
+    run a 'prepare_changes() { :; }; main_menu'
+expect "$(get http://10.203.1.2:18086)" B
+pass 'complete beginner menu to a working mapping using detected interface/address defaults'
+
 if get --interface 10.203.0.1 http://10.203.1.2:18080 >/dev/null 2>&1; then exit 1; fi
 ip -n "$prefix-u" addr add 10.203.0.3/24 dev uc
 if get --interface 10.203.0.3 --max-time 1 http://10.203.1.2:18080 >/dev/null 2>&1; then exit 1; fi
@@ -144,6 +150,13 @@ fi
 expect "$(get http://10.203.1.2:18084)" B
 run a 'iptables -C INPUT -p tcp --dport 49999 -m comment --comment sentinel -j ACCEPT'
 pass 'injected config failure rolls back files/firewall and restores working proxy'
+
+run a "$map4; LOCAL_PORT=18084; preflight_mapping 4 tcp nat; apply_current_mapping nat 4 4 tcp"
+expect "$(get http://10.203.1.2:18084)" 10.203.2.1
+udp 10.203.1.2 18084
+run a "$map4; LOCAL_PORT=18084; TARGET_IP=fd00:a2b:2::2; preflight_mapping 4 tcp proxy; apply_current_mapping proxy 4 6 tcp"
+expect "$(get http://10.203.1.2:18084)" B
+pass 'same-port Nginx -> NAT -> Nginx transitions keep unselected UDP working'
 
 run c 'LISTEN_IF=cu; LISTEN_ADDR=10.203.0.1; LOCAL_PORT=18085; TARGET_IP=10.203.1.2; TARGET_PORT=18080; EGRESS_IF=ca; SNAT_SOURCE=10.203.1.1; ALLOWED_SOURCE=10.203.0.2/32; add_nat_rules 4 iptables tcp'
 run a "$map4; remove_mapping_rules iptables 4 tcp; ALLOWED_SOURCE=10.203.1.1/32; add_nat_rules 4 iptables tcp"

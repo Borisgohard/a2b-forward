@@ -324,7 +324,7 @@ get_default_interface() {
 }
 
 get_first_up_interface() {
-    ip -o link show up | awk -F': ' '$2 != "lo" {print $2; exit}'
+    ip -o link show up | awk -F': ' '{split($2, name, "@"); if (name[1] != "lo") {print name[1]; exit}}'
 }
 
 get_route_line() {
@@ -621,11 +621,24 @@ restore_saved_rules() {
 
 migrate_legacy_rules() {
     local file tmp
-    for file in /etc/iptables/rules.v4 /etc/iptables/rules.v6; do
+    for file in "$@"; do
         [[ -f "$file" ]] || continue
         if grep -Eq '^:A2B_|^-A A2B_|-j A2B_' "$file"; then
             tmp="$(mktemp "${file}.XXXXXX")"
-            awk '!/^:A2B_/ && !/^-A A2B_/ && !/-j A2B_/' "$file" > "$tmp"
+            python3 - "$file" > "$tmp" <<'PY'
+import shlex, sys
+owned = {"A2B_INPUT", "A2B_FORWARD", "A2B_PREROUTING", "A2B_POSTROUTING"}
+with open(sys.argv[1]) as source:
+    for line in source:
+        words = shlex.split(line)
+        remove = bool(words and words[0].startswith(":") and words[0][1:] in owned)
+        if words and words[0] == "-A":
+            remove = remove or words[1] in owned
+            if "-j" in words:
+                remove = remove or words[words.index("-j") + 1] in owned
+        if not remove:
+            print(line, end="")
+PY
             chmod --reference="$file" "$tmp"
             mv -f -- "$tmp" "$file"
             info "已从旧快照移除 A2B 条目，保留其它规则: $file"
@@ -669,7 +682,7 @@ save_rules() {
         chmod 600 "$tmp"
         mv -f -- "$tmp" "$file"
     done
-    migrate_legacy_rules
+    migrate_legacy_rules /etc/iptables/rules.v4 /etc/iptables/rules.v6
     write_rules_restore_service
     info "A2B 规则已保存并启用开机恢复。当前内核规则已生效，恢复服务首次运行可在重启后显示 active (exited)。"
 }
@@ -1002,13 +1015,10 @@ for line in sys.stdin:
                 die "$LOCAL_PORT/$proto 的监听地址已被其它本机服务占用，请换入口端口或地址。"
             fi
         fi
-        if [[ -n "$sockets" && "$engine" == nat ]]; then
-            die "这个入口当前由 Nginx 使用。请先通过删除向导清理旧配置，再切换到 NAT。"
-        fi
     done
     if [[ " $protocols " == *" tcp "* ]]; then
         if ! probe_tcp "$TARGET_IP" "$TARGET_PORT"; then
-            confirm_yes_no "下一跳未连接成功。是否仍仅保存转发配置，稍后修复 B/安全组/隧道" N || die "已取消，请先确认下一跳服务。"
+            confirm_yes_no "下一跳未连接成功。是否仍仅保存转发配置，稍后修复 B/安全组/隧道" N || die "已取消，请先确认下一跳服务。" # 交互: 连接失败默认停止，显式确认才允许保存待部署配置。
         fi
     else
         info "UDP 无通用握手，本次不会把路由可达当成 UDP 服务已通过。请用实际客户端验证。"
@@ -1070,7 +1080,7 @@ confirm_config() {
         echo
     fi
 
-    echo "同入口协议族、端口和 TCP/UDP 的已有映射会被替换；未选择的协议保持原样。已有连接沿用旧 conntrack，重新连接才使用新目标。"
+    echo "同入口协议族、端口和 TCP/UDP 的已有映射会被替换；未选择的协议保持原样。已有 NAT 连接沿用旧 conntrack；跨引擎切换可能中断旧代理连接，请重连客户端。"
     confirm_yes_no "确认写入配置" Y || die "已取消。" # 交互: 展示完整参数和更新范围后才写入。
 }
 
@@ -1290,13 +1300,13 @@ write_proxy_mapping() {
 remove_proxy_config() {
     if command -v systemctl >/dev/null 2>&1 && [[ -f "$PROXY_SERVICE" ]]; then
         systemctl disable --now a2b-forward-proxy.service >/dev/null 2>&1 || true
-        systemctl daemon-reload >/dev/null 2>&1 || true
     fi
 
     if [[ -d "$PROXY_CONF_DIR" ]]; then
         find "$PROXY_CONF_DIR" -type f -name '*.conf' -delete
     fi
     rm -f "$PROXY_CONF" "$PROXY_SERVICE"
+    systemctl daemon-reload
     info "已删除本脚本管理的跨协议族代理配置。"
 }
 
@@ -1348,7 +1358,7 @@ remove_managed_rules() {
     backup_rules
     remove_managed_rules_for_cmd iptables
     remove_managed_rules_for_cmd ip6tables
-    migrate_legacy_rules
+    migrate_legacy_rules /etc/iptables/rules.v4 /etc/iptables/rules.v6
     remove_proxy_config
     rm -f "$SYSCTL_V4_FILE" "$SYSCTL_V6_FILE" "$SYSCTL_PERF_FILE"
     if (( keep_wg )); then
@@ -1691,6 +1701,16 @@ apply_current_mapping() {
         [[ "$target_family" == "6" ]] && cmd="ip6tables"
         configure_sysctl "$target_family"
         add_nat_rules "$target_family" "$cmd" "$protocols"
+        if [[ -f "$PROXY_CONF" ]]; then
+            if compgen -G "$PROXY_CONF_DIR/*.conf" >/dev/null; then
+                nginx -t -c "$PROXY_CONF"
+                if systemctl is-active --quiet a2b-forward-proxy.service; then
+                    systemctl reload a2b-forward-proxy.service
+                fi
+            else
+                remove_proxy_config
+            fi
+        fi
         save_rules
     else
         write_proxy_mapping "$listen_family" "$target_family" "$protocols"
@@ -1745,9 +1765,9 @@ add_b_proxy_workflow() {
     echo "  4. 无共同地址族时需双栈中转；NAT64/CLAT 只在网络已提供转换能力时适用。"
     echo
 
-    if ! confirm_yes_no "B 上的代理程序是否已经安装并监听端口" "Y"; then
+    if ! confirm_yes_no "B 上的代理程序是否已经安装并监听端口" "Y"; then # 交互: 检查 B 侧准备条件，避免把端口转发误当成安装代理。
         warn "脚本运行在 A 上，无法直接安装 B 的代理程序。请先在 B 上安装 SOCKS5/HTTP/sing-box/Xray/Squid 等代理，并让它监听 WireGuard 内网 IP 或 0.0.0.0/::。"
-        if ! confirm_yes_no "是否仍继续生成 A 侧转发/隧道配置" "N"; then
+        if ! confirm_yes_no "是否仍继续生成 A 侧转发/隧道配置" "N"; then # 交互: B 未就绪时默认取消，可显式准备 A 的配置。
             die "已取消。"
         fi
     fi
@@ -1775,7 +1795,7 @@ add_b_proxy_workflow() {
             ;;
         relay)
             show_relay_guide
-            confirm_yes_no "中转 R 到 B 已经配置并测试完成" N || die "请先在 R 配置到 B 的转发，再回到本机。"
+            confirm_yes_no "中转 R 到 B 已经配置并测试完成" N || die "请先在 R 配置到 B 的转发，再回到本机。" # 交互: 确认下游链路先完成，当前目标随后填写 R 的入口。
             TARGET_NODE_LABEL="中转R"
             target_family="$(choose_direct_target_family)"
             ;;
@@ -2002,6 +2022,7 @@ main() {
     trap on_exit EXIT
     trap 'exit 130' INT
     trap 'exit 143' TERM
+    trap 'exit 129' HUP
     case "${1:-}" in
         "") main_menu ;;
         --status) show_managed_rules ;;

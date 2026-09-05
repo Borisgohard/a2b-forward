@@ -55,6 +55,24 @@ check 'menu EOF cancels' reject bash -c 'source ./iptables_Forward.sh; prompt_ch
 check 'required EOF cancels' reject bash -c 'source ./iptables_Forward.sh; prompt_required value </dev/null'
 check 'no secret-bearing ERR command dump' reject grep -q BASH_COMMAND iptables_Forward.sh
 
+temp="$(mktemp -d)"
+trap 'rm -rf -- "$temp"' EXIT
+cat > "$temp/legacy" <<'EOF'
+*filter
+:INPUT ACCEPT [0:0]
+:A2B_INPUT - [0:0]
+:A2B_OTHER - [0:0]
+-A INPUT -j A2B_INPUT
+-A A2B_INPUT -p tcp --dport 80 -j ACCEPT
+-A INPUT -m comment --comment "text -j A2B_INPUT" -j ACCEPT
+-A INPUT -j A2B_OTHER
+COMMIT
+EOF
+migrate_legacy_rules "$temp/legacy"
+check 'migration removes owned chain declaration' reject grep -q '^:A2B_INPUT ' "$temp/legacy"
+check 'migration keeps unrelated A2B prefix' grep -q '^:A2B_OTHER ' "$temp/legacy"
+check 'migration keeps a comment mentioning an owned jump' grep -q 'text -j A2B_INPUT' "$temp/legacy"
+
 parse_target_input 6 '[2001:db8::1]:0080'
 check 'IPv6 socket parse address' equal "$TARGET_IP" 2001:db8::1
 check 'IPv6 socket parse port' equal "$TARGET_PORT" 0080
