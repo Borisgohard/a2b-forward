@@ -53,6 +53,7 @@ check 'port EOF cancels' reject bash -c 'source ./iptables_Forward.sh; prompt_po
 check 'default EOF cancels' reject bash -c 'source ./iptables_Forward.sh; prompt_default value 1 </dev/null'
 check 'menu EOF cancels' reject bash -c 'source ./iptables_Forward.sh; prompt_choice choose 1 "1 2" </dev/null'
 check 'required EOF cancels' reject bash -c 'source ./iptables_Forward.sh; prompt_required value </dev/null'
+check 'status menu does not install dependencies' bash -c 'source ./iptables_Forward.sh; install_base_dependencies() { exit 99; }; main_menu <<< 2 >/dev/null'
 check 'no secret-bearing ERR command dump' reject grep -q BASH_COMMAND iptables_Forward.sh
 
 temp="$(mktemp -d)"

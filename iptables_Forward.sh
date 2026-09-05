@@ -1003,13 +1003,22 @@ preflight_mapping() {
         sockets="$(ss "-$family" -H -lnp"${proto:0:1}" "sport = :$LOCAL_PORT")"
         if [[ -n "$sockets" ]]; then
             if ! printf '%s\n' "$sockets" | python3 -c '
-import ipaddress, sys
+import ipaddress, pathlib, re, sys
 address, pid = sys.argv[1:]
+def owned(candidate):
+    if candidate == pid:
+        return True
+    try:
+        # Nginx 优雅重载时旧 worker 可能暂时独自持有监听 socket。
+        fields = pathlib.Path(f"/proc/{candidate}/stat").read_text().rsplit(")", 1)[1].split()
+        return fields[1] == pid
+    except (OSError, IndexError):
+        return False
 for line in sys.stdin:
     fields = line.split()
     local = fields[3].rsplit(":", 1)[0].strip("[]")
     relevant = not address or local in ("*", "0.0.0.0", "::") or ipaddress.ip_address(local) == ipaddress.ip_address(address)
-    if relevant and f"pid={pid}," not in line:
+    if relevant and not any(owned(p) for p in re.findall(r"pid=(\d+),", line)):
         sys.exit(1)
 ' "$LISTEN_ADDR" "$pid"; then
                 die "$LOCAL_PORT/$proto 的监听地址已被其它本机服务占用，请换入口端口或地址。"

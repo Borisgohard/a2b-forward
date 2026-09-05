@@ -180,6 +180,15 @@ result="$(ip netns exec "$prefix-u" curl --noproxy '' -fsS --max-time 5 --socks5
 expect "$result" WEBSITE
 expect "$result" 10.203.3.1
 pass 'real SOCKS5 client -> C -> A -> B -> isolated website, observed egress is B'
+
+# 删除转发但保留已生成隧道时，UDP 握手入口及其恢复文件也必须留下。
+printf '%s\n' keeptest 51831 10.67.0.1/32 10.67.0.2/32 fd67::1/128 fd67::2/128 1420 10.203.1.1 y |
+    run c 'create_wireguard_tunnel'
+printf '%s\n' y y | run c 'remove_managed_rules'
+run c 'wg show keeptest >/dev/null; remove_managed_rules_for_cmd iptables; restore_saved_rules; iptables -C A2B_INPUT -p udp --dport 51831 -m comment --comment "a2b-forward wireguard listen 51831" -j ACCEPT'
+if run c 'create_wireguard_tunnel' <<< keeptest; then exit 1; fi
+pass 'uninstall retains generated WireGuard, persisted UDP permission, and rejects accidental key overwrite'
+
 run a "$map4; LOCAL_PORT=19083; TARGET_IP=fd00:a2b:2::2; TARGET_PORT=19080; apply_current_mapping proxy 4 6 tcp"
 result="$(ip netns exec "$prefix-u" curl --noproxy '' -fsS --max-time 5 --socks5-hostname 10.203.1.2:19083 http://10.203.3.2:18083)"
 expect "$result" 10.203.3.1
