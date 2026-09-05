@@ -4,6 +4,7 @@
 set -Eeuo pipefail
 # shellcheck source=iptables_Forward.sh
 source "$A2B_REPO/iptables_Forward.sh"
+NGINX_WORKERS=1
 PROXY_DIR="$A2B_TEST_ROOT/$NODE/proxy"
 PROXY_CONF_DIR="$PROXY_DIR/conf.d"
 PROXY_CONF="$PROXY_DIR/nginx.conf"

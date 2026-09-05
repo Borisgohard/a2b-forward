@@ -30,3 +30,13 @@ Thumbs.db
 .tools/
 .local/
 __pycache__/
+
+# Private deployment material is kept outside the public checkout.
+audit/
+Overview report+*
+normal/config*.json
+tun/config*.json
+server/*current*.json
+*.db
+*.exe
+*.dll

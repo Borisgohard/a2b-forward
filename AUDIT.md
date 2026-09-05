@@ -2,7 +2,13 @@
 
 ## 2026-09-06 复核
 
-基线：`d6ddacd`。工作目录：`Y:\Forward`。本次授权范围：重新 code review、修复并验证、完善交互和新手文档、推送 `Borisgohard/a2b-forward`。使用临时分支 `codex/review-reliability` 执行 Linux CI，完成验收后快进主分支。GitHub 网络访问使用命令级 `127.0.0.1:42343` 代理。
+基线：`d6ddacd`。工作目录：`Y:\Forward`。本次授权范围：重新 code review、修复并验证、完善交互和新手文档、推送 `Borisgohard/a2b-forward`。使用临时分支 `codex/review-reliability` 执行 Linux CI；发布前同步并合并远端改动，不强推。GitHub 网络访问使用命令级 `127.0.0.1:42343` 代理。
+
+### 同期远端改动的合并
+
+发布前发现远端新增 `d68b94f`、`245ce68`。已保留其提交历史、[原始资源事件审计](docs/REVIEW-20260906.md)、敏感文件忽略规则和回归断言；将原网络测试另存为 `tests/regression-network.sh`，与本轮完整套件一起在同一个双系统 CI 工作流运行，避免重复工作流遗漏依赖。该历史审计中的 VPS/OOM/coturn 操作属于另一轮记录，本轮没有连接这些 VPS。
+
+合并候选 NAT/Nginx 预检、失败重载保留原服务、可覆盖的测试模块路径/单 worker 参数、Docker 启动顺序、私有变更日志。可选连接容量调优保留为默认关闭，补充低内存保护与事务 sysctl 快照；不恢复旧版无条件大缓冲区调优。接口/CIDR 测试改用合并后统一的标准库校验入口。WireGuard 新建确认默认取消。
 
 ### 确认的问题与处理
 
