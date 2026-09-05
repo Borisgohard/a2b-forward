@@ -83,4 +83,22 @@ for spec in 'nat4 4 4 nat' 'nat6 6 6 nat' 'proxy46 4 6 proxy' 'proxy64 6 4 proxy
     check "$mode target" equal "$(mode_target_family "$mode")" "$target"
     check "$mode engine" equal "$(mode_engine "$mode")" "$engine"
 done
+capacity_case() (
+    local memory="$1" conntrack="$2" queue="$3" expected="$4" written='' applied=0
+    awk() { printf '%s\n' "$memory"; }
+    sysctl() {
+        if [[ "$2" == net.netfilter.nf_conntrack_max ]]; then
+            printf '%s\n' "$conntrack"
+        else
+            printf '%s\n' "$queue"
+        fi
+    }
+    write_sysctl_file() { shift; written="$*"; }
+    apply_sysctl_file() { applied=1; }
+    configure_performance_tuning >/dev/null
+    [[ "$written" == "$expected" ]] && [[ -z "$written" || "$applied" == 1 ]]
+)
+check 'capacity tuning skips low memory' capacity_case 131072 32768 4096 ''
+check 'capacity tuning only raises low limits' capacity_case 1048576 32768 4096 'net.netfilter.nf_conntrack_max=262144 net.core.somaxconn=65535'
+check 'capacity tuning preserves higher existing limits' capacity_case 1048576 1048576 131072 ''
 printf 'Unit checks: %s passed\n' "$passed"

@@ -30,9 +30,23 @@
 
 ### 验证记录
 
-- 本地 Git Bash 语法检查、ShellCheck 0.11.0、59 项输入与逻辑检查通过。
-- 已添加 Ubuntu 22.04 / 24.04 CI：内核 NAT、Nginx 跨族 TCP/UDP、两跳、实际 SOCKS5 出口、WireGuard、持久化、故障恢复、有限吞吐对照。
-- Linux CI 的最终结果在本次发布完成前补录。不能将历史 VPS 测试视为本次版本验证。
+- 本地 Git Bash 语法检查、ShellCheck 0.11.0 通过；目前 `unit.sh` 66 项、`test_core.sh` 32 项通过，包含低内存跳过/只提高过低容量/保留较高现值三个新用例。两个套件有重叠断言，数量不代表互不重复的功能数。
+- 合并后的运行逻辑在 [CI 33999030575](https://github.com/Borisgohard/a2b-forward/actions/runs/33999030575) 通过 Ubuntu 22.04 与 24.04：当时为 63 项单元检查、32 项核心检查、12 组候选更新回归、18 组完整集成测试；随后补的三项容量断言只增加测试，不改变调优实现。
+- 真实路径覆盖：NAT44/NAT66 TCP 与多报文 UDP、Nginx46/64、来源限制及更新、TCP 更新保留 UDP、Nginx/NAT 来回切换、完整中文向导、两跳 SOCKS5 的 B 出口、sing-box 1.14.0 加密代理模板、生成的 WireGuard 双栈隧道与 B 出口、保留隧道的卸载、无目标族路由拒绝、规则恢复和真实 systemd 进程故障恢复。
+- 配置故障注入检查旧文件/旧规则与原流量；候选 NAT 无效时不动旧链，Nginx 重载失败时保留旧服务。发行版默认 HTTP Nginx 服务在安装转发依赖后保持 inactive。
+- 早期测试发现并修正了测试替身的服务状态输出、Ubuntu 22.04 的 `systemctl --kill-who` 参数兼容、Nginx 优雅退出 worker 暂持监听的冲突判定。失败运行未作为通过证据。
+- 发布前/后分别检查 Git 敏感文件边界、私钥/令牌模式及匿名下载一致性。模式扫描不是不存在所有形式秘密的数学证明；历史 VPS 验证不替代本次版本测试。
+
+### 有限吞吐样本
+
+以下取自合并后同一次 CI 的完整日志，单位 Mbps。iperf3 每项请求 2 秒，P 是并行流数；环境是同一 VM 的 veth，不是公网测试，也不是新旧版本对比。
+
+| CI 环境 | 直连 P1 | NAT P1 | 直连 P4 | NAT P4 |
+| --- | ---: | ---: | ---: | ---: |
+| Ubuntu 22.04 | 23488.0 | 3768.4 | 25134.4 | 24406.5 |
+| Ubuntu 24.04 | 25314.1 | 26363.9 | 62946.7 | 60330.0 |
+
+Ubuntu 22.04 的 NAT P1 墙钟约 12 秒，结果明显波动，不能据此承诺性能不退化，更不能把单项较快解释为优化收益。测试仅要求能够持续传输并记录结果；真实线路仍需要多轮长时、丢包、CPU 与内存对照测试。
 
 ### 影响与边界
 
@@ -43,15 +57,20 @@
 - 未部署公网 NAT64/464XLAT 网关，地址合成通过不代表运营商具有转换能力。
 - CI 吞吐只反映同机虚拟网络的短时结果；公网带宽、时延、丢包、MTU、云安全组和长期稳定性需部署后测量。
 - 本地 `.local/`、`.tools/` 已忽略，Git 凭据仅经系统凭据助手在内存中使用，不写入公开文件。
+- 测试网络命名空间不提供内存隔离。完整测试要求一次性 CI/VM 与至少 1 GiB 可用内存；候选回归要求至少 256 MiB。Nginx 测试固定单 worker，CI 分别限制 180/480 秒并在退出/信号时清理。生产部署的 Nginx 仍按 CPU 自动创建 worker，需要按 VPS 资源做容量规划。
 
 ### 复现
 
 ```bash
 bash tests/unit.sh
+bash tests/test_core.sh
 shellcheck -x iptables_Forward.sh tests/*.sh
 # 仅在可丢弃的 Linux 测试机执行，需安装 workflow 中的依赖：
-sudo bash tests/integration.sh
+sudo env A2B_TEST_DISPOSABLE=yes timeout 180 bash tests/regression-network.sh
+sudo env A2B_TEST_DISPOSABLE=yes timeout 480 bash tests/integration.sh
 ```
+
+真实 systemd 生命周期部分仅在一次性 CI VM (`CI=true`) 运行；普通手动运行会明确跳过该项。不能在业务机器上设置 `CI=true` 来强行开启它。
 
 ### 设计依据
 
