@@ -83,6 +83,7 @@ need_systemd() {
 }
 
 install_proxy_dependencies() {
+    local install_status=0
     if command -v nginx >/dev/null 2>&1; then
         if [[ ! -f /usr/lib/nginx/modules/ngx_stream_module.so ]] && command -v apt-get >/dev/null 2>&1; then
             export DEBIAN_FRONTEND=noninteractive
@@ -97,11 +98,19 @@ install_proxy_dependencies() {
         die "跨 IPv4/IPv6 代理需要 Nginx stream。当前系统没有 apt-get，请手动安装 nginx 和 stream 模块。"
     fi
 
-    info "正在安装跨协议族代理依赖: nginx libnginx-mod-stream"
+    info "正在安装跨协议族代理依赖。新安装的默认 nginx.service 将保持停用，只运行 A2B 的独立服务。"
     export DEBIAN_FRONTEND=noninteractive
-    apt-get update
-    apt-get install -y nginx
-    apt-get install -y libnginx-mod-stream || warn "libnginx-mod-stream 安装失败；如果 nginx 已内置 stream 模块，可忽略。"
+    # 包安装默认会启动 HTTP :80；临时 mask 仅用于此前不存在的发行版服务。
+    if systemctl cat nginx.service >/dev/null 2>&1 || [[ -e /run/systemd/system/nginx.service || -L /run/systemd/system/nginx.service || -e /etc/systemd/system/nginx.service || -L /etc/systemd/system/nginx.service ]]; then
+        die "nginx 命令缺失，但已存在 nginx.service 定义/屏蔽。请先修复现有 Nginx 安装，再运行向导。"
+    fi
+    (
+        systemctl mask --runtime nginx.service
+        trap 'install_status=$?; systemctl unmask --runtime nginx.service; exit "$install_status"' EXIT
+        apt-get update
+        apt-get install -y --no-remove nginx libnginx-mod-stream
+        systemctl disable nginx.service
+    )
 }
 
 install_wireguard_dependencies() {

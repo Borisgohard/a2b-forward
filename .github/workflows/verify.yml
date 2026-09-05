@@ -19,7 +19,10 @@ jobs:
       - name: Dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y --no-remove shellcheck iproute2 iptables nginx libnginx-mod-stream wireguard-tools dante-server iperf3
+          sudo apt-get install -y --no-remove shellcheck iproute2 iptables wireguard-tools dante-server iperf3
+      - name: Install forwarding proxy without starting a default HTTP site
+        run: |
+          sudo bash -c 'source ./iptables_Forward.sh; install_proxy_dependencies; if systemctl is-active --quiet nginx.service; then exit 1; fi'
       - name: Pinned sing-box for beginner example verification
         run: |
           curl -fL --retry 3 https://github.com/SagerNet/sing-box/releases/download/v1.14.0/sing-box-1.14.0-linux-amd64.tar.gz -o /tmp/sing-box.tar.gz
