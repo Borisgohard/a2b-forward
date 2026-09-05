@@ -18,7 +18,6 @@ PROXY_DIR="/etc/a2b-forward"
 PROXY_CONF_DIR="${PROXY_DIR}/conf.d"
 PROXY_CONF="${PROXY_DIR}/nginx.conf"
 PROXY_SERVICE="/etc/systemd/system/a2b-forward-proxy.service"
-PROXY_LOG_DIR="/var/log/a2b-forward"
 PROXY_PID="/run/a2b-forward-nginx.pid"
 WG_DIR="/etc/wireguard"
 WG_EXPORT_DIR="/root/a2b-forward-wireguard"
@@ -1064,7 +1063,7 @@ wait_proxy_ready() {
         (( ready )) && return 0
         sleep 0.1
     done
-    die "Nginx 未能建立预期监听，请检查 $PROXY_LOG_DIR/error.log。"
+    die "Nginx 未能建立预期监听，请执行 journalctl -u a2b-forward-proxy -n 60 查看原因。"
 }
 
 confirm_config() {
@@ -1194,7 +1193,7 @@ proxy_config_name() {
 }
 
 write_proxy_master_config() {
-    mkdir -p "$PROXY_DIR" "$PROXY_CONF_DIR" "$PROXY_LOG_DIR"
+    mkdir -p "$PROXY_DIR" "$PROXY_CONF_DIR"
 
     {
         if [[ -f /usr/lib/nginx/modules/ngx_stream_module.so ]]; then
@@ -1205,7 +1204,7 @@ write_proxy_master_config() {
 worker_processes auto;
 worker_rlimit_nofile 1048576;
 pid ${PROXY_PID};
-error_log ${PROXY_LOG_DIR}/error.log warn;
+error_log stderr warn;
 
 events {
     worker_connections 65535;
@@ -1239,6 +1238,8 @@ TimeoutStopSec=15
 Restart=always
 RestartSec=2
 LimitNOFILE=1048576
+StandardOutput=journal
+StandardError=journal
 
 [Install]
 WantedBy=multi-user.target
