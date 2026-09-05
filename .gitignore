@@ -27,4 +27,6 @@ wg-*.conf
 Thumbs.db
 .vscode/
 .idea/
-
+.tools/
+.local/
+__pycache__/

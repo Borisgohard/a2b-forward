@@ -1,0 +1,31 @@
+name: Verify
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  linux:
+    name: Linux ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04]
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-remove shellcheck iproute2 iptables nginx libnginx-mod-stream wireguard-tools dante-server iperf3
+      - name: Syntax and lint
+        run: |
+          bash -n iptables_Forward.sh
+          shellcheck -x iptables_Forward.sh tests/*.sh
+          git diff --check
+      - name: Unit checks
+        run: bash tests/unit.sh
+      - name: Real network and service tests
+        run: sudo --preserve-env=CI bash tests/integration.sh
