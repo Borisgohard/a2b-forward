@@ -4,7 +4,8 @@
 
 set -Eeuo pipefail
 
-trap 'echo "ERROR: failed at line ${LINENO}: ${BASH_COMMAND}" >&2' ERR
+trap 'echo "错误: 第 ${LINENO} 行执行失败；请查看本次审计日志。" >&2' ERR
+umask 077
 
 TAG="a2b-forward"
 CHAIN_PRE="A2B_PREROUTING"
@@ -20,11 +21,14 @@ PROXY_CONF="${PROXY_DIR}/nginx.conf"
 PROXY_SERVICE="/etc/systemd/system/a2b-forward-proxy.service"
 PROXY_LOG_DIR="/var/log/a2b-forward"
 PROXY_PID="/run/a2b-forward-nginx.pid"
+NGINX_STREAM_MODULE="/usr/lib/nginx/modules/ngx_stream_module.so"
+NGINX_WORKERS=auto
 WG_DIR="/etc/wireguard"
 WG_EXPORT_DIR="/root/a2b-forward-wireguard"
 RULES_V4_FILE="/etc/iptables/a2b-rules.v4"
 RULES_V6_FILE="/etc/iptables/a2b-rules.v6"
 RULES_RESTORE_SERVICE="/etc/systemd/system/a2b-forward-rules.service"
+INSTALLED_SCRIPT="/usr/local/lib/a2b-forward/iptables_Forward.sh"
 ENTRY_NODE_LABEL="A"
 TARGET_NODE_LABEL="B"
 
@@ -50,7 +54,8 @@ need_root() {
 install_base_dependencies() {
     local missing=0
 
-    for cmd in ip iptables ip6tables iptables-save ip6tables-save iptables-restore ip6tables-restore; do
+    local cmd
+    for cmd in ip iptables ip6tables iptables-save ip6tables-save iptables-restore ip6tables-restore python3 flock; do
         if ! command -v "$cmd" >/dev/null 2>&1; then
             missing=1
         fi
@@ -58,7 +63,6 @@ install_base_dependencies() {
 
     if (( missing == 0 )); then
         info "基础依赖已就绪: iproute2, iptables"
-        ensure_persistent_helper
         return
     fi
 
@@ -69,35 +73,56 @@ install_base_dependencies() {
     info "正在安装基础依赖: iproute2 iptables"
     export DEBIAN_FRONTEND=noninteractive
     apt-get update
-    apt-get install -y iproute2 iptables
-    ensure_persistent_helper
+    apt-get install -y --no-remove iproute2 iptables python3 util-linux
 }
 
-ensure_persistent_helper() {
-    if command -v netfilter-persistent >/dev/null 2>&1; then
-        return
-    fi
+validate_network_value() {
+    python3 - "$@" <<'PY'
+import ipaddress
+import re
+import sys
 
-    if ! command -v apt-get >/dev/null 2>&1; then
-        warn "未安装 netfilter-persistent。脚本会改用 a2b-forward-rules.service 保存并开机恢复规则。"
-        return
-    fi
-
-    if dpkg-query -W -f='${Status}' ufw 2>/dev/null | grep -q "install ok installed"; then
-        warn "检测到 ufw 已安装，跳过 iptables-persistent，避免移除 ufw；脚本会改用 a2b-forward-rules.service 开机恢复规则。"
-        return
-    fi
-
-    info "尝试安装 iptables-persistent；若会移除 ufw/其它包则自动放弃。"
-    export DEBIAN_FRONTEND=noninteractive
-    if ! apt-get install -y --no-remove iptables-persistent; then
-        warn "iptables-persistent 安装被跳过，避免移除现有防火墙组件；脚本会改用 a2b-forward-rules.service 开机恢复规则。"
-    fi
+kind, value, *extra = sys.argv[1:]
+try:
+    if kind == "ip":
+        address = ipaddress.ip_address(value)
+        if "%" in value:
+            raise ValueError("不接受带作用域的地址")
+        print(address.version)
+    elif kind == "cidr":
+        address = ipaddress.ip_interface(value)
+        if address.version != int(extra[0]) or "%" in value:
+            raise ValueError("CIDR 协议族不匹配")
+    elif kind == "interface":
+        if not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,14}", value):
+            raise ValueError("接口名应为 1-15 个字母、数字、下划线、点或短横线")
+    elif kind == "endpoint":
+        try:
+            ipaddress.ip_address(value)
+        except ValueError:
+            if len(value) > 253 or not all(re.fullmatch(
+                r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?", part
+            ) for part in value.rstrip(".").split(".")):
+                raise ValueError("Endpoint 应为 IP 或域名，不含端口或配置指令")
+        if "%" in value:
+            raise ValueError("不接受带作用域的地址")
+    elif kind == "nat64":
+        network = ipaddress.IPv6Network(value, strict=True)
+        if network.prefixlen != 96:
+            raise ValueError("当前仅支持 /96 NAT64 前缀")
+        print(ipaddress.IPv6Address(int(network.network_address) |
+                                   int(ipaddress.IPv4Address(extra[0]))))
+    else:
+        raise ValueError("未知校验类型")
+except ValueError as exc:
+    print(str(exc), file=sys.stderr)
+    sys.exit(1)
+PY
 }
 
 install_proxy_dependencies() {
     if command -v nginx >/dev/null 2>&1; then
-        if [[ ! -f /usr/lib/nginx/modules/ngx_stream_module.so ]] && command -v apt-get >/dev/null 2>&1; then
+        if [[ ! -f "$NGINX_STREAM_MODULE" ]] && command -v apt-get >/dev/null 2>&1; then
             export DEBIAN_FRONTEND=noninteractive
             apt-get update
             apt-get install -y libnginx-mod-stream || warn "libnginx-mod-stream 安装失败；如果 nginx 已内置 stream 模块，可忽略。"
@@ -135,7 +160,7 @@ install_wireguard_dependencies() {
 
 validate_port() {
     local port="$1"
-    [[ "$port" =~ ^[0-9]+$ ]] && (( port >= 1 && port <= 65535 ))
+    [[ "$port" =~ ^[0-9]{1,5}$ ]] && (( 10#$port >= 1 && 10#$port <= 65535 ))
 }
 
 prompt_port() {
@@ -145,14 +170,14 @@ prompt_port() {
 
     while true; do
         if [[ -n "$default" ]]; then
-            read -r -p "$prompt [$default]: " value # 交互: 输入端口；留空时使用默认端口。
+            read -r -p "$prompt [$default]: " value || die "输入结束，已取消。"
             value="${value:-$default}"
         else
-            read -r -p "$prompt: " value # 交互: 输入必须由用户指定的端口。
+            read -r -p "$prompt: " value || die "输入结束，已取消。"
         fi
 
         if validate_port "$value"; then
-            echo "$value"
+            echo "$((10#$value))"
             return
         fi
 
@@ -165,7 +190,7 @@ prompt_default() {
     local default="$2"
     local value
 
-    read -r -p "$prompt [$default]: " value # 交互: 输入可覆盖自动检测值；留空使用默认值。
+    read -r -p "$prompt [$default]: " value || die "输入结束，已取消。"
     echo "${value:-$default}"
 }
 
@@ -180,51 +205,11 @@ detect_ip_family() {
     local ip
 
     ip="$(normalize_ip "$1")"
-    if [[ "$ip" == *:* ]]; then
-        echo "6"
-        return
-    fi
-    if [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-        echo "4"
-        return
-    fi
-
-    return 1
-}
-
-ipv4_to_nat64_tail() {
-    local ipv4="$1"
-    local a b c d octet n
-    local parts
-
-    IFS=. read -r a b c d <<< "$ipv4"
-    parts=("$a" "$b" "$c" "$d")
-
-    for octet in "${parts[@]}"; do
-        [[ "$octet" =~ ^[0-9]+$ ]] || return 1
-        n=$((10#$octet))
-        (( n >= 0 && n <= 255 )) || return 1
-    done
-
-    printf '%02x%02x:%02x%02x\n' "$((10#$a))" "$((10#$b))" "$((10#$c))" "$((10#$d))"
+    validate_network_value ip "$ip"
 }
 
 nat64_addr_from_prefix() {
-    local prefix="$1"
-    local ipv4="$2"
-    local base
-    local tail
-
-    tail="$(ipv4_to_nat64_tail "$ipv4")" || return 1
-    base="${prefix%%/*}"
-    base="${base#\[}"
-    base="${base%\]}"
-
-    if [[ "$base" == *: ]]; then
-        echo "${base}${tail}"
-    else
-        echo "${base}:${tail}"
-    fi
+    validate_network_value nat64 "$1" "$2"
 }
 
 strip_cidr() {
@@ -260,7 +245,7 @@ confirm_yes_no() {
     local default="${2:-Y}"
     local answer
 
-    read -r -p "$prompt [$default]: " answer # 交互: 二次确认会改动系统配置或继续执行关键步骤。
+    read -r -p "$prompt [$default]: " answer || die "输入结束，已取消。"
     answer="${answer:-$default}"
 
     case "$answer" in
@@ -307,16 +292,31 @@ get_iface_address() {
 }
 
 backup_rules() {
-    local backup_dir="/root/${TAG}-backup-$(date +%Y%m%d-%H%M%S)"
+    local backup_dir
+    backup_dir="$(mktemp -d "/root/${TAG}-backup-$(date +%Y%m%d-%H%M%S)-XXXXXX")"
+    local file
 
     mkdir -p "$backup_dir"
     iptables-save > "${backup_dir}/rules.v4"
     ip6tables-save > "${backup_dir}/rules.v6"
+    export_managed_rules iptables > "${backup_dir}/managed.v4"
+    export_managed_rules ip6tables > "${backup_dir}/managed.v6"
     if [[ -d "$PROXY_DIR" ]]; then
         cp -a "$PROXY_DIR" "${backup_dir}/proxy-config"
     fi
     if [[ -d "$WG_EXPORT_DIR" ]]; then
         cp -a "$WG_EXPORT_DIR" "${backup_dir}/wireguard-export"
+    fi
+    for file in "$PROXY_SERVICE" "$RULES_RESTORE_SERVICE" "$SYSCTL_V4_FILE" "$SYSCTL_V6_FILE" "$SYSCTL_PERF_FILE"; do
+        [[ ! -f "$file" ]] || cp -p "$file" "$backup_dir/"
+    done
+    if [[ -d "$WG_EXPORT_DIR" ]]; then
+        for file in "$WG_EXPORT_DIR"/*-B.conf; do
+            [[ -f "$file" ]] || continue
+            file="${file##*/}"
+            file="${WG_DIR}/${file%-B.conf}.conf"
+            [[ ! -f "$file" ]] || cp -p "$file" "$backup_dir/"
+        done
     fi
     info "已备份当前规则和代理配置到: $backup_dir"
 }
@@ -353,14 +353,24 @@ configure_sysctl() {
 
     if [[ "$family" == "4" ]]; then
         write_sysctl_file "$SYSCTL_V4_FILE" \
-            "net.ipv4.ip_forward=1" \
-            "net.ipv4.conf.all.rp_filter=0" \
-            "net.ipv4.conf.default.rp_filter=0"
+            "net.ipv4.ip_forward=1"
         apply_sysctl_file "$SYSCTL_V4_FILE"
-        info "已开启 IPv4 转发，并关闭 rp_filter 以避免非对称路径误丢包。"
+        info "已开启 IPv4 转发；保留现有 rp_filter 策略。"
     else
-        write_sysctl_file "$SYSCTL_V6_FILE" \
-            "net.ipv6.conf.all.forwarding=1"
+        local path iface
+        local settings=()
+        # Preserve SLAAC/RA routes on interfaces that already accept advertisements.
+        for path in /proc/sys/net/ipv6/conf/*/accept_ra; do
+            [[ -r "$path" ]] || continue
+            iface="${path%/accept_ra}"
+            iface="${iface##*/}"
+            [[ "$iface" != all && "$iface" != lo ]] || continue
+            if [[ "$(cat "$path")" != 0 ]]; then
+                settings+=("net/ipv6/conf/${iface}/accept_ra=2")
+            fi
+        done
+        settings+=("net.ipv6.conf.all.forwarding=1")
+        write_sysctl_file "$SYSCTL_V6_FILE" "${settings[@]}"
         apply_sysctl_file "$SYSCTL_V6_FILE"
         info "已开启 IPv6 转发。"
     fi
@@ -382,20 +392,8 @@ configure_performance_tuning() {
         settings+=("net.netfilter.nf_conntrack_max=${target}")
     fi
 
-    if [[ -r /proc/sys/net/core/somaxconn ]]; then
+    if [[ -r /proc/sys/net/core/somaxconn ]] && (( $(cat /proc/sys/net/core/somaxconn) < 65535 )); then
         settings+=("net.core.somaxconn=65535")
-    fi
-
-    if [[ -r /proc/sys/net/core/rmem_max ]]; then
-        settings+=("net.core.rmem_max=134217728")
-    fi
-
-    if [[ -r /proc/sys/net/core/wmem_max ]]; then
-        settings+=("net.core.wmem_max=134217728")
-    fi
-
-    if [[ -r /proc/sys/net/ipv4/tcp_fin_timeout ]]; then
-        settings+=("net.ipv4.tcp_fin_timeout=15")
     fi
 
     if (( ${#settings[@]} == 0 )); then
@@ -443,6 +441,17 @@ ensure_rule_append() {
     local table="$2"
     local chain="$3"
     shift 3
+
+    if [[ -n "${RULE_STAGE:-}" ]]; then
+        python3 - "$RULE_STAGE" "$table" "$chain" "$@" <<'PY'
+import json
+import sys
+path, table, chain, *args = sys.argv[1:]
+with open(path, "a", encoding="utf-8") as out:
+    out.write(table + "\t-A " + chain + " " + " ".join(json.dumps(x) for x in args) + "\n")
+PY
+        return
+    fi
 
     if [[ "$table" == "filter" ]]; then
         if ! "$cmd" -w -C "$chain" "$@" 2>/dev/null; then
@@ -511,15 +520,19 @@ write_rules_restore_service() {
     fi
 
     service_name="$(basename "$RULES_RESTORE_SERVICE")"
+    mkdir -p "${INSTALLED_SCRIPT%/*}"
+    if [[ "$(readlink -f "${BASH_SOURCE[0]}")" != "$INSTALLED_SCRIPT" ]]; then
+        install -m 700 "${BASH_SOURCE[0]}" "$INSTALLED_SCRIPT"
+    fi
     cat > "$RULES_RESTORE_SERVICE" <<EOF
 [Unit]
 Description=A2B forwarding firewall rules restore
-After=local-fs.target ufw.service netfilter-persistent.service
-Wants=network-pre.target
+After=network-online.target ufw.service netfilter-persistent.service docker.service
+Wants=network-online.target
 
 [Service]
 Type=oneshot
-ExecStart=/bin/sh -c 'test -s ${RULES_V4_FILE} && iptables-restore < ${RULES_V4_FILE} || true; test -s ${RULES_V6_FILE} && ip6tables-restore < ${RULES_V6_FILE} || true'
+ExecStart=/bin/bash ${INSTALLED_SCRIPT} --restore
 RemainAfterExit=yes
 
 [Install]
@@ -530,24 +543,59 @@ EOF
     systemctl enable "$service_name" >/dev/null 2>&1 || warn "无法启用 ${service_name}，请手动检查 systemd 状态。"
 }
 
-save_rules() {
-    mkdir -p /etc/iptables
+export_managed_rules() {
+    "$1-save" | awk '
+        /^\*/ { table=$0; next }
+        /^-A A2B_(PREROUTING|POSTROUTING|FORWARD|INPUT) / { rules[table]=rules[table] $0 "\n" }
+        END {
+            print "*nat\n:A2B_PREROUTING - [0:0]\n:A2B_POSTROUTING - [0:0]"
+            printf "%s", rules["*nat"]
+            print "COMMIT\n*filter\n:A2B_FORWARD - [0:0]\n:A2B_INPUT - [0:0]"
+            printf "%s", rules["*filter"]
+            print "COMMIT"
+        }'
+}
 
-    iptables-save > "$RULES_V4_FILE"
-    ip6tables-save > "$RULES_V6_FILE"
-    cp "$RULES_V4_FILE" /etc/iptables/rules.v4
-    cp "$RULES_V6_FILE" /etc/iptables/rules.v6
-    chmod 600 "$RULES_V4_FILE" "$RULES_V6_FILE" /etc/iptables/rules.v4 /etc/iptables/rules.v6 2>/dev/null || true
+restore_managed_rules() {
+    local cmd file
+    for cmd in iptables ip6tables; do
+        file="$RULES_V4_FILE"
+        [[ "$cmd" != ip6tables ]] || file="$RULES_V6_FILE"
+        [[ -s "$file" ]] || continue
+        "$cmd-restore" --wait 10 --noflush --test < "$file"
+        "$cmd-restore" --wait 10 --noflush < "$file"
+        ensure_chain "$cmd"
+        ensure_input_chain "$cmd"
+    done
+}
 
-    if command -v netfilter-persistent >/dev/null 2>&1; then
-        if ! netfilter-persistent save >/dev/null 2>&1; then
-            warn "netfilter-persistent save 失败，已保留脚本自己的规则文件和 systemd 恢复服务。"
+clean_legacy_persistence() {
+    local file
+    for file in /etc/iptables/rules.v4 /etc/iptables/rules.v6; do
+        [[ -f "$file" ]] || continue
+        if grep -qE '^:A2B_(PREROUTING|POSTROUTING|FORWARD|INPUT) ' "$file"; then
+            cp -p "$file" "${file}.before-a2b-$(date +%Y%m%d-%H%M%S).bak"
+            awk '
+                /^:A2B_(PREROUTING|POSTROUTING|FORWARD|INPUT) / { next }
+                /^-A A2B_(PREROUTING|POSTROUTING|FORWARD|INPUT) / { next }
+                / -j A2B_(PREROUTING|POSTROUTING|FORWARD|INPUT)$/ { next }
+                { print }
+            ' "$file" > "${file}.tmp"
+            mv "${file}.tmp" "$file"
+            info "已从旧持久化文件迁出 A2B 链，保留其它规则: $file"
         fi
-    fi
+    done
+}
 
+save_rules() {
+    mkdir -p "${RULES_V4_FILE%/*}"
+    export_managed_rules iptables > "${RULES_V4_FILE}.tmp"
+    export_managed_rules ip6tables > "${RULES_V6_FILE}.tmp"
+    mv "${RULES_V4_FILE}.tmp" "$RULES_V4_FILE"
+    mv "${RULES_V6_FILE}.tmp" "$RULES_V6_FILE"
+    clean_legacy_persistence
     write_rules_restore_service
-    systemctl enable netfilter-persistent >/dev/null 2>&1 || true
-    info "NAT/放行规则已保存，并通过 a2b-forward-rules.service 配置为开机自动恢复。"
+    info "仅 A2B 链已保存；开机恢复使用 --noflush，保留其它防火墙规则和默认策略。"
 }
 
 show_chain() {
@@ -750,7 +798,7 @@ collect_common_config() {
 
     default_listen_addr="$(get_iface_address "$listen_family" "$LISTEN_IF")"
     if [[ -n "$default_listen_addr" ]]; then
-        LISTEN_ADDR="$(prompt_default "${ENTRY_NODE_LABEL} 监听 IP，输入 * 表示该网卡所有 IPv${listen_family} 地址" "$default_listen_addr")" # 交互: 限定当前入口机器的监听地址；* 表示所有本机地址。
+        LISTEN_ADDR="$(prompt_default "${ENTRY_NODE_LABEL} 监听 IP，输入 * 表示所有本机 IPv${listen_family} 地址" "$default_listen_addr")" # 交互: NAT 还匹配入口网卡；Nginx 按监听地址绑定。
         [[ "$LISTEN_ADDR" == "*" ]] && LISTEN_ADDR=""
         LISTEN_ADDR="$(normalize_ip "$LISTEN_ADDR")"
     else
@@ -775,6 +823,14 @@ collect_common_config() {
 
     read -r -p "允许访问 ${ENTRY_NODE_LABEL}:${LOCAL_PORT} 的来源 CIDR，留空表示所有来源: " ALLOWED_SOURCE # 交互: 限制谁能访问当前入口机器的入口端口，建议填上一跳公网 IP/32 或 IPv6/128。
     ALLOWED_SOURCE="$(normalize_ip "$ALLOWED_SOURCE")"
+    [[ -z "$LISTEN_ADDR" || "$(detect_ip_family "$LISTEN_ADDR")" == "$listen_family" ]] || die "监听 IP 协议族不匹配。"
+    [[ -z "$ALLOWED_SOURCE" ]] || validate_network_value cidr "$ALLOWED_SOURCE" "$listen_family" || die "允许来源 CIDR 无效。"
+    if [[ "$engine" == nat ]]; then
+        [[ "$(detect_ip_family "$SNAT_SOURCE")" == "$target_family" ]] || die "SNAT 地址无效。"
+    fi
+    validate_network_value interface "$LISTEN_IF" || die "入口网卡名无效。"
+    [[ -z "$EGRESS_IF" ]] || validate_network_value interface "$EGRESS_IF" || die "出口网卡名无效。"
+    TARGET_PORT="$((10#$TARGET_PORT))"
 }
 
 confirm_config() {
@@ -801,6 +857,7 @@ confirm_config() {
         echo "  ${ENTRY_NODE_LABEL} 到 ${TARGET_NODE_LABEL} 出口协议族: IPv${target_family}，由系统路由表决定出口"
     fi
     echo "  允许来源: ${shown_source}"
+    echo "  同协议族、同传输协议、同入口端口的旧 A2B NAT 映射会被替换；已建立连接须重连。"
     echo
     if [[ "$engine" == "proxy" ]]; then
         echo "跨协议族说明:"
@@ -827,8 +884,13 @@ add_nat_rules() {
     local post_args
     local fwd_new_args
     local fwd_reply_args
-
-    ensure_chain "$cmd"
+    local stage before candidate
+    stage="$(mktemp -d)"
+    before="$stage/before"
+    candidate="$stage/candidate"
+    local RULE_STAGE="$stage/new"
+    : > "$RULE_STAGE"
+    export_managed_rules "$cmd" > "$before"
 
     if [[ "$family" == "6" ]]; then
         dnat_target="[${TARGET_IP}]:${TARGET_PORT}"
@@ -840,6 +902,7 @@ add_nat_rules() {
         comment="${TAG} ${proto} ${LOCAL_PORT}->${TARGET_IP}:${TARGET_PORT}"
 
         pre_args=(-i "$LISTEN_IF")
+        pre_args+=(-m addrtype --dst-type LOCAL)
         [[ -n "$ALLOWED_SOURCE" ]] && pre_args+=(-s "$ALLOWED_SOURCE")
         [[ -n "$LISTEN_ADDR" ]] && pre_args+=(-d "$LISTEN_ADDR")
         pre_args+=(-p "$proto" --dport "$LOCAL_PORT" -m comment --comment "$comment" -j DNAT --to-destination "$dnat_target")
@@ -847,17 +910,52 @@ add_nat_rules() {
 
         post_args=(-o "$EGRESS_IF")
         [[ -n "$ALLOWED_SOURCE" ]] && post_args+=(-s "$ALLOWED_SOURCE")
-        post_args+=(-p "$proto" -d "$TARGET_IP" --dport "$TARGET_PORT" -m comment --comment "$comment" -j SNAT --to-source "$SNAT_SOURCE")
+        post_args+=(-p "$proto" -d "$TARGET_IP" --dport "$TARGET_PORT" -m conntrack --ctstate DNAT --ctorigdstport "$LOCAL_PORT" -m comment --comment "$comment" -j SNAT --to-source "$SNAT_SOURCE")
         ensure_rule_append "$cmd" nat "$CHAIN_POST" "${post_args[@]}"
 
         fwd_new_args=(-i "$LISTEN_IF" -o "$EGRESS_IF")
         [[ -n "$ALLOWED_SOURCE" ]] && fwd_new_args+=(-s "$ALLOWED_SOURCE")
-        fwd_new_args+=(-p "$proto" -d "$TARGET_IP" --dport "$TARGET_PORT" -m conntrack --ctstate NEW,ESTABLISHED,RELATED -m comment --comment "$comment" -j ACCEPT)
+        fwd_new_args+=(-p "$proto" -d "$TARGET_IP" --dport "$TARGET_PORT" -m conntrack --ctstate DNAT --ctorigdstport "$LOCAL_PORT" -m comment --comment "$comment" -j ACCEPT)
         ensure_rule_append "$cmd" filter "$CHAIN_FWD" "${fwd_new_args[@]}"
 
-        fwd_reply_args=(-i "$EGRESS_IF" -o "$LISTEN_IF" -p "$proto" -s "$TARGET_IP" --sport "$TARGET_PORT" -m conntrack --ctstate ESTABLISHED,RELATED -m comment --comment "$comment" -j ACCEPT)
+        fwd_reply_args=(-i "$EGRESS_IF" -o "$LISTEN_IF" -p "$proto" -s "$TARGET_IP" --sport "$TARGET_PORT" -m conntrack --ctstate DNAT --ctdir REPLY --ctorigdstport "$LOCAL_PORT" -m comment --comment "$comment" -j ACCEPT)
         ensure_rule_append "$cmd" filter "$CHAIN_FWD" "${fwd_reply_args[@]}"
     done
+    python3 - "$before" "$RULE_STAGE" "$LOCAL_PORT" "$protocols" > "$candidate" <<'PY'
+import pathlib
+import shlex
+import sys
+before, additions, port, protocols = sys.argv[1:]
+prefixes = tuple("a2b-forward " + p + " " + port + "->" for p in protocols.split())
+new = {"nat": [], "filter": []}
+for line in pathlib.Path(additions).read_text().splitlines():
+    table, rule = line.split("\t", 1)
+    new[table].append(rule)
+table = None
+for line in pathlib.Path(before).read_text().splitlines():
+    if line.startswith("*"):
+        table = line[1:]
+    if line.startswith("-A "):
+        args = shlex.split(line)
+        if "--comment" in args and args[args.index("--comment") + 1].startswith(prefixes):
+            continue
+    if line == "COMMIT":
+        for rule in new[table]:
+            print(rule)
+    print(line)
+PY
+    if ! "$cmd-restore" --wait 10 --noflush --test < "$candidate"; then
+        rm -r "$stage"
+        die "NAT 候选规则校验失败，原规则未改动。"
+    fi
+    if ! "$cmd-restore" --wait 10 --noflush < "$candidate"; then
+        "$cmd-restore" --wait 10 --noflush < "$before" || warn "自动恢复失败，请使用审计备份。"
+        rm -r "$stage"
+        die "NAT 写入失败，已尝试恢复原 A2B 规则。"
+    fi
+    unset RULE_STAGE
+    ensure_chain "$cmd"
+    rm -r "$stage"
 }
 
 nginx_addr_port() {
@@ -907,12 +1005,12 @@ write_proxy_master_config() {
     mkdir -p "$PROXY_DIR" "$PROXY_CONF_DIR" "$PROXY_LOG_DIR"
 
     {
-        if [[ -f /usr/lib/nginx/modules/ngx_stream_module.so ]]; then
-            echo "load_module /usr/lib/nginx/modules/ngx_stream_module.so;"
+        if [[ -f "$NGINX_STREAM_MODULE" ]]; then
+            echo "load_module ${NGINX_STREAM_MODULE};"
             echo
         fi
         cat <<EOF
-worker_processes auto;
+worker_processes ${NGINX_WORKERS};
 worker_rlimit_nofile 1048576;
 pid ${PROXY_PID};
 error_log ${PROXY_LOG_DIR}/error.log warn;
@@ -962,10 +1060,21 @@ write_proxy_mapping() {
     local name
     local conf_file
     local listen_line
+    local live_dir="$PROXY_CONF_DIR" live_master="$PROXY_CONF" stage file
+    local changed=() was_active=false
 
     install_proxy_dependencies
+    mkdir -p "$PROXY_DIR"
+    stage="$(mktemp -d "${PROXY_DIR}/.candidate.XXXXXX")"
+    mkdir -p "$stage/conf.d" "$stage/old"
+    if [[ -d "$live_dir" ]]; then
+        cp -a "$live_dir/." "$stage/conf.d/"
+        cp -a "$live_dir/." "$stage/old/"
+    fi
+    [[ ! -f "$live_master" ]] || cp -p "$live_master" "$stage/old-master"
+    [[ ! -f "$PROXY_SERVICE" ]] || cp -p "$PROXY_SERVICE" "$stage/old-service"
+    local PROXY_CONF_DIR="$stage/conf.d" PROXY_CONF="$stage/nginx.conf"
     write_proxy_master_config
-    write_proxy_service
 
     listen_socket="$(nginx_addr_port "$listen_family" "$LISTEN_ADDR" "$LOCAL_PORT")"
     target_socket="$(nginx_proxy_pass_target "$target_family" "$TARGET_IP" "$TARGET_PORT")"
@@ -973,6 +1082,7 @@ write_proxy_mapping() {
     for proto in $protocols; do
         name="$(proxy_config_name "$listen_family" "$target_family" "$proto")"
         conf_file="${PROXY_CONF_DIR}/${name}.conf"
+        changed+=("${name}.conf")
 
         if [[ "$proto" == "udp" ]]; then
             listen_line="listen ${listen_socket} udp reuseport"
@@ -993,26 +1103,64 @@ write_proxy_mapping() {
             fi
             echo "    proxy_pass ${target_socket};"
             echo "    proxy_connect_timeout 5s;"
-            echo "    proxy_timeout 1h;"
+            if [[ "$proto" == udp ]]; then
+                echo "    proxy_timeout 5m;"
+            else
+                echo "    proxy_timeout 1h;"
+                echo "    proxy_socket_keepalive on;"
+            fi
             echo "    access_log off;"
             echo "}"
         } > "$conf_file"
     done
 
     if ! nginx -t -c "$PROXY_CONF"; then
-        die "Nginx stream 配置测试失败。请确认 nginx 已安装 stream 模块，且监听端口未被其它程序占用。"
+        rm -r "$stage"
+        die "Nginx 候选配置校验失败，现有配置和进程保持不变。"
     fi
 
     if ! command -v systemctl >/dev/null 2>&1; then
+        rm -r "$stage"
         die "跨协议族代理需要 systemd 托管高可用服务，但当前系统没有 systemctl。"
     fi
 
+    PROXY_CONF_DIR="$live_dir"
+    PROXY_CONF="$live_master"
+    mkdir -p "$live_dir"
+    for file in "${changed[@]}"; do
+        install -m 600 "$stage/conf.d/$file" "$live_dir/$file"
+    done
+    write_proxy_master_config
+    write_proxy_service
     systemctl daemon-reload
     if systemctl is-active --quiet a2b-forward-proxy.service; then
-        systemctl reload a2b-forward-proxy.service || systemctl restart a2b-forward-proxy.service
-    else
-        systemctl enable --now a2b-forward-proxy.service
+        was_active=true
     fi
+    local applied=false
+    if [[ "$was_active" == true ]]; then
+        if systemctl reload a2b-forward-proxy.service; then applied=true; fi
+    else
+        if systemctl enable --now a2b-forward-proxy.service; then applied=true; fi
+    fi
+    if [[ "$applied" != true ]]; then
+        for file in "${changed[@]}"; do
+            if [[ -f "$stage/old/$file" ]]; then
+                cp -p "$stage/old/$file" "$live_dir/$file"
+            else
+                rm -f "$live_dir/$file"
+            fi
+        done
+        if [[ -f "$stage/old-master" ]]; then cp -p "$stage/old-master" "$live_master"; else rm -f "$live_master"; fi
+        if [[ -f "$stage/old-service" ]]; then cp -p "$stage/old-service" "$PROXY_SERVICE"; else rm -f "$PROXY_SERVICE"; fi
+        if [[ "$was_active" != true ]]; then
+            systemctl disable --now a2b-forward-proxy.service || true
+        fi
+        systemctl daemon-reload
+        rm -r "$stage"
+        die "Nginx 服务应用失败，已恢复旧配置；未强制重启原服务。"
+    fi
+    systemctl enable a2b-forward-proxy.service >/dev/null
+    rm -r "$stage"
     info "跨协议族代理服务已启用: a2b-forward-proxy.service"
 }
 
@@ -1065,19 +1213,37 @@ remove_wireguard_config() {
         rm -f "${WG_DIR}/${iface}.conf" "$file"
     done
 
-    find "$WG_EXPORT_DIR" -type f -delete 2>/dev/null || true
     rmdir "$WG_EXPORT_DIR" 2>/dev/null || true
     info "已停用并删除本脚本生成的 WireGuard 配置。"
 }
 
 remove_managed_rules() {
+    local file iface port retained=false
+    confirm_yes_no "确认删除所有 A2B 入口转发及跨族代理（现有连接可能中断）" "N" || return 0
     backup_rules
+    remove_wireguard_config
     remove_managed_rules_for_cmd iptables
     remove_managed_rules_for_cmd ip6tables
-    save_rules
+    clean_legacy_persistence
     remove_rules_restore_service
     remove_proxy_config
-    remove_wireguard_config
+    for file in "$WG_EXPORT_DIR"/*-B.conf; do
+        [[ -f "$file" ]] || continue
+        iface="${file##*/}"
+        iface="${iface%-B.conf}"
+        [[ -f "$WG_DIR/$iface.conf" ]] || continue
+        port="$(awk -F= '/^[[:space:]]*ListenPort[[:space:]]*=/ {gsub(/[[:space:]]/, "", $2); print $2; exit}' "$WG_DIR/$iface.conf")"
+        if validate_port "$port"; then
+            allow_wireguard_input "$port"
+            retained=true
+        fi
+    done
+    if [[ "$retained" == true ]]; then
+        save_rules
+        info "已保留 WireGuard UDP 放行规则及其开机恢复服务。"
+    fi
+    rm -f "$SYSCTL_V4_FILE" "$SYSCTL_V6_FILE" "$SYSCTL_PERF_FILE"
+    warn "已移除本项目 sysctl 文件；运行中的共享内核参数未强制回退，请按备份核对。"
     info "已删除本脚本管理的 NAT 规则和代理配置。"
 }
 
@@ -1086,7 +1252,7 @@ prompt_required() {
     local value
 
     while true; do
-        read -r -p "$prompt: " value # 交互: 输入必填值，空值会导致后续配置无法生成。
+        read -r -p "$prompt: " value || die "输入结束，已取消。"
         if [[ -n "$value" ]]; then
             echo "$value"
             return
@@ -1099,7 +1265,7 @@ choose_primary_workflow() {
     local choice
 
     echo "请选择配置目标:" >&2
-    echo "1. 推荐: B 上运行代理，A 做公网入口，A-B 优先使用 WireGuard 隧道。" >&2
+    echo "1. 推荐: B 上运行代理，A 做公网入口，按现有网络选择直连或隧道。" >&2
     echo "2. 高级: 只配置 A 到 B 任意端口转发，不额外处理 WireGuard。" >&2
     echo "3. 只创建/刷新 A-B WireGuard 隧道配置，不添加入口端口转发。" >&2
     echo "4. 链式代理: 本地 -> C -> A -> B，分步骤配置 C->A 和 A->B。" >&2
@@ -1150,13 +1316,13 @@ choose_ab_transport() {
 
     echo "请选择 A 和 B 之间的传输方式:" >&2
     echo "1. 已有 WireGuard 隧道：最快落地，继续用现有 B 隧道 IP。" >&2
-    echo "2. 新建 WireGuard 隧道：推荐，高性能、低延迟、加密，适合长期使用。" >&2
-    echo "3. 不用 WireGuard：直接走 A 到 B 现有公网/内网路由，简单但安全性和稳定性较弱。" >&2
+    echo "2. 新建 WireGuard 隧道：适合需要私网互通或额外加密的链路，会增加封装开销。" >&2
+    echo "3. 不用 WireGuard：直接走现有公网/内网路由，适合已加密的 Reality/TLS 服务。" >&2
     echo "4. NAT64/464XLAT：A 是 IPv6-only、B 是 IPv4-only，且 A 所在网络已有 NAT64/CLAT 能力。" >&2
     echo "5. 双栈中转/其它隧道：把双栈机器作为 A，或先建好隧道后按现有路由填写 B 地址。" >&2
-    read -r -p "请输入选项 [2]: " choice # 交互: 选择 A-B 承载链路，推荐 WireGuard。
+    read -r -p "请输入选项 [3]: " choice # 交互: 默认复用当前链路，不自动新建隧道。
 
-    case "${choice:-2}" in
+    case "${choice:-3}" in
         1) echo "existing_wg" ;;
         2) echo "new_wg" ;;
         3) echo "direct_route" ;;
@@ -1204,15 +1370,22 @@ create_wireguard_tunnel() {
     install_wireguard_dependencies
 
     iface="$(prompt_default "WireGuard 接口名" "a2b0")" # 交互: 设置 A/B 两端 WireGuard 接口名。
+    validate_network_value interface "$iface" || die "WireGuard 接口名无效。"
     listen_port="$(prompt_port "A WireGuard UDP 监听端口，B 会连接这个端口" "51820")" # 交互: 设置 A 上 WireGuard 握手端口。
     a_ipv4_cidr="$(prompt_default "A WireGuard IPv4 内网地址/CIDR" "10.66.66.1/24")" # 交互: 设置 A 的隧道 IPv4 地址。
     b_ipv4_cidr="$(prompt_default "B WireGuard IPv4 内网地址/CIDR" "10.66.66.2/24")" # 交互: 设置 B 的隧道 IPv4 地址。
     a_ipv6_cidr="$(prompt_default "A WireGuard IPv6 内网地址/CIDR" "fd66:66:66::1/64")" # 交互: 设置 A 的隧道 IPv6 地址。
     b_ipv6_cidr="$(prompt_default "B WireGuard IPv6 内网地址/CIDR" "fd66:66:66::2/64")" # 交互: 设置 B 的隧道 IPv6 地址。
     mtu="$(prompt_default "WireGuard MTU，常见公网/VPS 推荐 1420" "1420")" # 交互: 设置 WireGuard MTU，路径不稳定时可降低到 1380。
-    [[ "$mtu" =~ ^[0-9]+$ ]] || die "MTU 必须是数字。"
+    [[ "$mtu" =~ ^[0-9]{4}$ ]] && (( 10#$mtu >= 1280 && 10#$mtu <= 9000 )) || die "双栈 WireGuard MTU 必须在 1280-9000。"
     echo "提示: B 必须能访问你接下来填写的 A 公网地址；IPv4-only 的 B 不能直连只有 IPv6 的 A，反之亦然。"
     a_endpoint="$(prompt_required "B 连接 A 使用的公网地址/IP/DDNS，不要带端口")" # 交互: 设置写入 B 配置的 A 公网 Endpoint。
+    a_endpoint="$(normalize_ip "$a_endpoint")"
+    validate_network_value endpoint "$a_endpoint" || die "WireGuard Endpoint 无效。"
+    validate_network_value cidr "$a_ipv4_cidr" 4 || die "A IPv4 CIDR 无效。"
+    validate_network_value cidr "$b_ipv4_cidr" 4 || die "B IPv4 CIDR 无效。"
+    validate_network_value cidr "$a_ipv6_cidr" 6 || die "A IPv6 CIDR 无效。"
+    validate_network_value cidr "$b_ipv6_cidr" 6 || die "B IPv6 CIDR 无效。"
 
     a_ipv4="$(strip_cidr "$a_ipv4_cidr")"
     b_ipv4="$(strip_cidr "$b_ipv4_cidr")"
@@ -1223,12 +1396,13 @@ create_wireguard_tunnel() {
     [[ "$(detect_ip_family "$b_ipv4")" == "4" ]] || die "B WireGuard IPv4 地址无效: $b_ipv4"
     [[ "$(detect_ip_family "$a_ipv6")" == "6" ]] || die "A WireGuard IPv6 地址无效: $a_ipv6"
     [[ "$(detect_ip_family "$b_ipv6")" == "6" ]] || die "B WireGuard IPv6 地址无效: $b_ipv6"
+    [[ "$a_ipv4" != "$b_ipv4" && "$a_ipv6" != "$b_ipv6" ]] || die "A/B 隧道地址不能相同。"
 
     a_conf="${WG_DIR}/${iface}.conf"
     b_conf="${WG_EXPORT_DIR}/${iface}-B.conf"
-    if [[ -f "$a_conf" ]] && ! confirm_yes_no "A 上已存在 ${a_conf}，是否覆盖" "N"; then
-        die "已取消覆盖 WireGuard 配置。"
-    fi
+    [[ ! -e "$a_conf" && ! -e "$b_conf" ]] || die "接口已有配置；请使用已有隧道，或为新隧道换一个接口名，避免轮换密钥中断连接。"
+    if ip link show dev "$iface" >/dev/null 2>&1; then die "同名网络接口已存在，请使用已有隧道或换一个名字。"; fi
+    confirm_yes_no "确认生成密钥、写入 A/B 配置并启动 A 端 WireGuard" "N" || die "已取消。"
     backup_rules
 
     keypair="$(wg_make_keypair)"
@@ -1284,9 +1458,12 @@ EOF
     allow_wireguard_input "$listen_port"
     save_rules
 
+    # Keep optional results available to callers sourcing this script.
+    # shellcheck disable=SC2034
     WG_IFACE="$iface"
     WG_B_IPV4="$b_ipv4"
     WG_B_IPV6="$b_ipv6"
+    # shellcheck disable=SC2034
     WG_B_CONFIG="$b_conf"
 
     echo
@@ -1339,10 +1516,6 @@ choose_b_proxy_target_via_nat64() {
     [[ "$(detect_ip_family "$b_ipv4" 2>/dev/null || true)" == "4" ]] || die "B 地址不是有效 IPv4: $b_ipv4"
 
     prefix="$(prompt_default "NAT64 /96 前缀，常见公网前缀是 64:ff9b::/96" "64:ff9b::/96")" # 交互: 指定上游 NAT64 前缀；不同运营商或自建网关可能不同。
-    if [[ "$prefix" != */96 ]]; then
-        warn "当前脚本只按 /96 NAT64 前缀生成地址；你输入的不是 /96，若网络不是 /96 前缀请改用隧道/WireGuard/双栈中转。"
-    fi
-
     nat64_ip="$(nat64_addr_from_prefix "$prefix" "$b_ipv4")" || die "无法根据 ${prefix} 和 ${b_ipv4} 生成 NAT64 地址。"
     PRESET_TARGET_IP="$nat64_ip"
     PRESET_TARGET_PORT="$(prompt_port "B 上代理程序监听端口")" # 交互: 指定 B 代理服务端口，A 将通过 NAT64 合成 IPv6 地址访问它。
@@ -1358,8 +1531,11 @@ apply_current_mapping() {
     local protocols="$4"
     local cmd
 
+    check_listener_conflicts "$engine" "$listen_family" "$protocols"
     backup_rules
-    configure_performance_tuning
+    if confirm_yes_no "是否应用可选高并发参数（普通转发保留现值即可）" "N"; then
+        configure_performance_tuning
+    fi
 
     if [[ "$engine" == "nat" ]]; then
         cmd="iptables"
@@ -1377,6 +1553,23 @@ apply_current_mapping() {
     echo "配置完成。上一跳现在可以连接: ${ENTRY_NODE_LABEL}:${LOCAL_PORT}"
     echo "实际转发目标: ${TARGET_NODE_LABEL}:${TARGET_IP}:${TARGET_PORT}"
     echo "持久化: 防火墙规则由 a2b-forward-rules.service 开机恢复；跨协议族代理由 a2b-forward-proxy.service 常驻；WireGuard 由 wg-quick@接口名托管。"
+}
+
+check_listener_conflicts() {
+    local engine="$1" family="$2" protocols="$3" proto sockets pid=""
+    [[ ! -s "$PROXY_PID" ]] || read -r pid < "$PROXY_PID"
+    for proto in $protocols; do
+        if [[ "$proto" == tcp ]]; then
+            sockets="$(ss "-$family" -H -lntp "sport = :$LOCAL_PORT")"
+        else
+            sockets="$(ss "-$family" -H -lnup "sport = :$LOCAL_PORT")"
+        fi
+        [[ -n "$sockets" ]] || continue
+        if [[ "$engine" == proxy && "$pid" =~ ^[0-9]+$ && "$sockets" == *"pid=$pid,"* ]]; then
+            continue
+        fi
+        die "IPv${family} ${proto} 端口 ${LOCAL_PORT} 已由本机服务监听，请换一个入口端口，避免影响 SSH/现有服务。"
+    done
 }
 
 add_advanced_mapping() {
@@ -1411,7 +1604,7 @@ add_b_proxy_workflow() {
     echo "关键原则:"
     echo "  1. 代理程序必须放在 B 上，这样目标网站看到的出口才是 B。"
     echo "  2. A 最好只做入口和转发，不承担访问目标网站的代理角色。"
-    echo "  3. A-B 之间优先使用 WireGuard；同协议族入口到同协议族隧道地址时，可走内核 NAT，性能最好。"
+    echo "  3. 同协议族现有路由可走内核 NAT；WireGuard 按加密/私网需求选择，性能需实测。"
     echo "  4. 双栈中转就是把双栈机器作为 A；NAT64/464XLAT 只在网络已提供转换能力时适用。"
     echo
 
@@ -1470,12 +1663,12 @@ show_chain_deploy_guide() {
     echo "链式代理部署顺序:"
     echo "  目标拓扑: 本地客户端 -> C -> A -> B -> 目标网站"
     echo "  第 1 步: 在 B 上安装并启动代理程序，让 B 用自己的网络访问目标网站。"
-    echo "  第 2 步: 在 A 上运行本脚本，选择“推荐: B 上运行代理”，完成 A -> B。"
-    echo "  第 3 步: 记住 A 的入口端口；在 C 上运行本脚本，选择“链式代理”，再选择“当前机器是 C”，完成 C -> A。"
+    echo "  第 2 步: 在 A 上运行本脚本，选择 [推荐: B 上运行代理]，完成 A -> B。"
+    echo "  第 3 步: 记住 A 的入口端口；在 C 上选择 [链式代理] 和 [当前机器是 C]，完成 C -> A。"
     echo "  第 4 步: 本地客户端只需要连接 C 的入口地址和端口。"
     echo
     echo "性能建议:"
-    echo "  1. A->B 优先 WireGuard；C->A 如果也不稳定，也建议先建 WireGuard。"
+    echo "  1. 优先复用稳定的现有路由；需要私网或加密时再选择 WireGuard。"
     echo "  2. 每一跳尽量使用同协议族地址，这样脚本会使用内核 NAT，性能最好。"
     echo "  3. 跨 IPv4/IPv6 的一跳会自动使用 Nginx stream L4 代理；这更通用，但性能略低于内核 NAT。"
     echo "  4. 每一跳都建议限制来源 CIDR，例如 A 只允许 C，C 只允许你的本地公网 IP。"
@@ -1577,15 +1770,30 @@ main_menu() {
     echo "   也支持链式代理：本地 -> C -> A -> B"
     echo "2. 查看本脚本管理的 NAT、跨族代理、WireGuard 导出配置"
     echo "3. 删除本脚本管理的 NAT/跨族代理配置，并可选择删除 WireGuard"
+    echo "0. 退出"
     read -r -p "请选择操作 [1]: " action # 交互: 选择新增、查看或删除本脚本管理的配置。
 
     case "${action:-1}" in
         1) add_mapping ;;
-        2) install_base_dependencies; show_managed_rules ;;
+        0) return ;;
+        2) show_managed_rules ;;
         3) install_base_dependencies; remove_managed_rules ;;
         *) die "无效选择: $action" ;;
     esac
 }
 
-need_root
-main_menu
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    need_root
+    mkdir -p /var/log/a2b-forward
+    AUDIT_LOG="/var/log/a2b-forward/operation-$(date +%Y%m%d-%H%M%S)-$$.log"
+    exec > >(tee -a "$AUDIT_LOG") 2>&1
+    info "操作日志: $AUDIT_LOG（权限 600；不记录密码或 WireGuard 私钥）"
+    command -v flock >/dev/null 2>&1 || die "缺少 flock，请先安装 util-linux。"
+    exec 9>/run/lock/a2b-forward.lock
+    flock -n 9 || die "另一个 a2b-forward 正在运行，请等待其结束。"
+    case "${1:-}" in
+        --restore) restore_managed_rules ;;
+        "") main_menu ;;
+        *) die "用法: bash $0 [--restore]" ;;
+    esac
+fi

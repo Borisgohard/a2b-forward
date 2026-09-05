@@ -1,0 +1,20 @@
+name: Regression
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  linux:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install test dependencies
+        run: sudo apt-get update && sudo apt-get install -y shellcheck iptables iproute2 nginx libnginx-mod-stream python3
+      - name: Shell syntax and core regressions
+        run: |
+          bash -n iptables_Forward.sh
+          shellcheck -x -S warning iptables_Forward.sh tests/*.sh
+          bash tests/test_core.sh
+      - name: Isolated real networking
+        run: sudo bash tests/integration.sh
