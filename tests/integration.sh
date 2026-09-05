@@ -87,6 +87,9 @@ ip -n "$prefix-w" route add default via 10.203.3.1
 for node in c a; do
     run "$node" 'sysctl -qw net.ipv4.ip_forward=1 net.ipv6.conf.all.forwarding=1'
 done
+# shellcheck disable=SC2016 # Evaluate sysctl inside A, not on the host.
+run a 'configure_sysctl 6; configure_sysctl 6; test "$(sysctl -n net.ipv6.conf.ac.accept_ra)" = 2; grep -q "net/ipv6/conf/ac/accept_ra=2" "$SYSCTL_V6_FILE"'
+pass 'IPv6 forwarding retains RA reception across repeated configuration'
 run a 'iptables -P FORWARD DROP; ip6tables -P FORWARD DROP; iptables -A INPUT -p tcp --dport 49999 -m comment --comment sentinel -j ACCEPT'
 
 for host in 0.0.0.0 ::; do
@@ -169,6 +172,38 @@ result="$(ip netns exec "$prefix-u" curl --noproxy '' -fsS --max-time 5 --socks5
 expect "$result" 10.203.3.1
 pass 'IPv4 entry -> IPv6 B SOCKS5 -> IPv4 website, exit remains B'
 
+# 新手文档中的加密代理示例，同一份模板经检查后实跑，而非只验证 JSON。
+if command -v sing-box >/dev/null 2>&1; then
+    python3 - "$A2B_REPO/examples/sing-box-server.json" "$A2B_TEST_ROOT" <<'PY'
+import base64, json, pathlib, secrets, sys
+source, root = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2])
+server = json.loads(source.read_text())
+key = base64.b64encode(secrets.token_bytes(16)).decode()
+server["inbounds"][0]["password"] = key
+client = {
+    "log": {"level": "warn"},
+    "inbounds": [{"type": "mixed", "listen": "127.0.0.1", "listen_port": 19101}],
+    "outbounds": [{"type": "shadowsocks", "tag": "encrypted", "server": "10.203.1.2",
+                   "server_port": 19100, "method": "2022-blake3-aes-128-gcm", "password": key}],
+    "route": {"final": "encrypted"},
+}
+for name, config in (("ss-server", server), ("ss-client", client)):
+    path = root / (name + ".json")
+    path.write_text(json.dumps(config))
+    path.chmod(0o600)
+PY
+    sing-box check -c "$A2B_TEST_ROOT/ss-server.json"
+    sing-box check -c "$A2B_TEST_ROOT/ss-client.json"
+    ip netns exec "$prefix-b" sing-box run -c "$A2B_TEST_ROOT/ss-server.json" > "$A2B_TEST_ROOT/ss-server.log" 2>&1 &
+    ip netns exec "$prefix-u" sing-box run -c "$A2B_TEST_ROOT/ss-client.json" > "$A2B_TEST_ROOT/ss-client.log" 2>&1 &
+    run a "$map4; LOCAL_PORT=19100; TARGET_IP=fd00:a2b:2::2; TARGET_PORT=8833; apply_current_mapping proxy 4 6 tcp"
+    result="$(ip netns exec "$prefix-u" curl --noproxy '' -fsS --max-time 5 --socks5-hostname 127.0.0.1:19101 http://10.203.3.2:18083)"
+    expect "$result" 10.203.3.1
+    pass 'beginner sing-box Shadowsocks 2022 example: encrypted traffic through A exits via B'
+else
+    echo 'SKIP encrypted beginner example (install the workflow-pinned sing-box binary)'
+fi
+
 # 直接运行交互式 WireGuard 配置生成器，再用真实 wg-quick 激活 B 导出配置。
 run a 'create_wireguard_tunnel' <<'INPUT'
 a2btest
@@ -240,7 +275,7 @@ if [[ "${CI:-}" == true && -d /run/systemd/system ]]; then
     expect "$(get http://10.203.1.2:18084)" B
     run a 'iptables -C INPUT -p tcp --dport 49999 -m comment --comment sentinel -j ACCEPT'
     old_pid="$(systemctl show -p MainPID --value a2b-forward-proxy.service)"
-    systemctl kill --kill-whom=main --signal=KILL a2b-forward-proxy.service
+    systemctl kill --kill-who=main --signal=KILL a2b-forward-proxy.service
     for _ in {1..30}; do
         sleep 0.2
         new_pid="$(systemctl show -p MainPID --value a2b-forward-proxy.service)"

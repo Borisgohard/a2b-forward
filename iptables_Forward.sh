@@ -984,14 +984,24 @@ PY
 }
 
 preflight_mapping() {
-    local family="$1" protocols="$2" engine="$3" proto sockets managed
+    local family="$1" protocols="$2" engine="$3" proto sockets pid=0
+    [[ ! -r "$PROXY_PID" ]] || read -r pid < "$PROXY_PID"
     for proto in $protocols; do
-        sockets="$(ss "-$family" -H -ln"${proto:0:1}" "sport = :$LOCAL_PORT")"
-        managed=0
-        if [[ -d "$PROXY_CONF_DIR" ]] && compgen -G "$PROXY_CONF_DIR/$family-*-$proto-*-$LOCAL_PORT.conf" >/dev/null; then
-            managed=1
+        sockets="$(ss "-$family" -H -lnp"${proto:0:1}" "sport = :$LOCAL_PORT")"
+        if [[ -n "$sockets" ]]; then
+            if ! printf '%s\n' "$sockets" | python3 -c '
+import ipaddress, sys
+address, pid = sys.argv[1:]
+for line in sys.stdin:
+    fields = line.split()
+    local = fields[3].rsplit(":", 1)[0].strip("[]")
+    relevant = not address or local in ("*", "0.0.0.0", "::") or ipaddress.ip_address(local) == ipaddress.ip_address(address)
+    if relevant and f"pid={pid}," not in line:
+        sys.exit(1)
+' "$LISTEN_ADDR" "$pid"; then
+                die "$LOCAL_PORT/$proto 的监听地址已被其它本机服务占用，请换入口端口或地址。"
+            fi
         fi
-        [[ -z "$sockets" || "$managed" == 1 ]] || die "$LOCAL_PORT/$proto 已被本机服务占用，请换入口端口。"
         if [[ -n "$sockets" && "$engine" == nat ]]; then
             die "这个入口当前由 Nginx 使用。请先通过删除向导清理旧配置，再切换到 NAT。"
         fi
@@ -1011,6 +1021,22 @@ preflight_mapping() {
         done
         UDP_TIMEOUT="$((10#$UDP_TIMEOUT))"
     fi
+}
+
+wait_proxy_ready() {
+    local family="$1" protocols="$2" proto pid=0 attempt ready
+    for ((attempt = 0; attempt < 30; attempt++)); do
+        ready=1
+        [[ ! -r "$PROXY_PID" ]] || read -r pid < "$PROXY_PID"
+        for proto in $protocols; do
+            if ! ss "-$family" -H -lnp"${proto:0:1}" "sport = :$LOCAL_PORT" | grep -F "pid=$pid," >/dev/null; then
+                ready=0
+            fi
+        done
+        (( ready )) && return 0
+        sleep 0.1
+    done
+    die "Nginx 未能建立预期监听，请检查 $PROXY_LOG_DIR/error.log。"
 }
 
 confirm_config() {
@@ -1257,6 +1283,7 @@ write_proxy_mapping() {
         systemctl enable --now a2b-forward-proxy.service
     fi
     systemctl is-active --quiet a2b-forward-proxy.service || die "代理服务未运行。"
+    wait_proxy_ready "$listen_family" "$protocols"
     info "跨协议族代理服务已启用: a2b-forward-proxy.service"
 }
 

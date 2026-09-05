@@ -58,7 +58,7 @@ systemctl() {
                 command nginx -c "$PROXY_CONF"
             fi ;;
         stop|disable)
-            if [[ "$unit" == a2b-forward-proxy.service && -f "$PROXY_PID" ]]; then
+            if [[ ( "$action" == stop || " $* " == *" --now "* ) && "$unit" == a2b-forward-proxy.service && -f "$PROXY_PID" ]]; then
                 command nginx -c "$PROXY_CONF" -s stop
             fi ;;
         *) printf 'Unsupported systemctl fixture action: %s\n' "$*" >&2; return 1 ;;

@@ -1,0 +1,18 @@
+{
+  "log": { "level": "warn" },
+  "dns": {
+    "servers": [{ "type": "local", "tag": "system" }]
+  },
+  "inbounds": [
+    {
+      "type": "shadowsocks",
+      "tag": "encrypted-in",
+      "listen": "::",
+      "listen_port": 8833,
+      "method": "2022-blake3-aes-128-gcm",
+      "password": "REPLACE_WITH_BASE64_KEY"
+    }
+  ],
+  "outbounds": [{ "type": "direct", "tag": "direct" }],
+  "route": { "default_domain_resolver": "system", "final": "direct" }
+}
