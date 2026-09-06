@@ -2,6 +2,8 @@
 
 [![Linux verification](https://github.com/Borisgohard/a2b-forward/actions/workflows/verify.yml/badge.svg?branch=main)](https://github.com/Borisgohard/a2b-forward/actions/workflows/verify.yml)
 
+固定版本请从 [正式发布页](https://github.com/Borisgohard/a2b-forward/releases) 下载脚本或源码包，并核对同页的 `SHA256SUMS`。下面的 `main` 下载地址是持续更新版本；需要可回退部署时，优先使用正式发布附件并记下版本号。
+
 中文交互式 Linux 端口转发工具。你连接 A，由 A 把流量送到 **B 上已有的代理程序**，最后由 B 访问网站。
 
 ```text
@@ -201,3 +203,11 @@ sudo journalctl -u a2b-forward-rules -u a2b-forward-proxy -n 60 --no-pager
 完整复核发现、测试边界和操作留痕见 [AUDIT.md](AUDIT.md)。
 
 测试只应在一次性 CI/测试 VM 运行。完整集成套件要求至少 1 GiB 可用内存，测试 Nginx 限为一个 worker，并设有超时和退出清理；network namespace 只隔离网络，不隔离宿主机内存。复现命令见审计，勿在承担业务的小内存 VPS 上压测。
+
+## 许可证
+
+本仓库代码采用 [MIT License](LICENSE)。允许商业使用、修改和再分发，须保留版权及许可声明，具体条款以 LICENSE 为准。Nginx、WireGuard、sing-box 等独立依赖仍遵循各自的许可证；本仓库发布附件不包含这些第三方程序。
+
+## 提交改动
+
+请在新分支修改后提交 Pull Request。`main` 要求分支保持最新，并通过 `Linux ubuntu-22.04` 和 `Linux ubuntu-24.04` 两项 GitHub Actions 检查；管理员也受约束，禁止强推和删除主分支。未解决的评审讨论会阻止合入。当前不强制第二位审阅者，方便单人维护。
