@@ -46,13 +46,10 @@ B 的服务应监听 A 可访问的地址，不能只监听 `127.0.0.1`。在 B 
 sudo apt-get update
 sudo apt-get install -y curl ca-certificates
 curl -fL --retry 3 https://raw.githubusercontent.com/Borisgohard/a2b-forward/main/iptables_Forward.sh -o iptables_Forward.sh
-bash -n iptables_Forward.sh
 sudo bash iptables_Forward.sh
 ```
 
 这是交互式脚本，必须先下载再运行。不要使用 `curl ... | bash`，否则标准输入被脚本内容占用，菜单无法正常输入。以后直接执行最后一行即可再次管理。
-
-请逐条确认上一条命令成功再继续。下载失败时不要运行残留文件；`bash -n` 成功通常没有输出。
 
 ### 3. 按这个顺序选择
 
@@ -69,8 +66,6 @@ B 地址类型：B 的可达地址是 IPv4 选 1，IPv6 选 2
 ```
 
 然后填写 A 的入口端口、B 地址与代理端口。网卡、监听 IP 和 SNAT 源 IP 都会给出自动检测值；普通单网卡 VPS 通常直接回车即可。填完来源 IP/CIDR 后，脚本探测 B 的 TCP 端口，再显示完整配置让你确认。
-
-“是否提高连接容量上限”保持默认 `N`。它不是网速开关；仅在确实有高并发容量需求时考虑开启。菜单选错可重新输入，输入结束会取消，主菜单 `0` 退出。创建 WireGuard 是单独确认的阶段，隧道建好后取消后续端口配置不会删除已建好的隧道。
 
 云平台通过 NAT 映射公网 IPv4 时，网卡可能只有内网 IPv4。**监听/SNAT 填本机网卡真实地址，本地客户端仍填云平台的公网入口地址。**
 
@@ -96,8 +91,6 @@ curl --noproxy "" --proxy socks5h://A_IP:A_PORT --proxy-user YOUR_USER --connect
 ```
 
 Windows PowerShell 请把 `curl` 写成 `curl.exe`。IPv6 代理地址写成 `socks5h://[A_IPV6]:A_PORT`。HTTP 代理把 `socks5h://` 换成 `http://`；sing-box/Xray 等协议请使用对应客户端。
-
-VLESS/Reality/Shadowsocks 等不能直接当作浏览器的 HTTP 代理。先启动本地对应客户端，再让浏览器连接客户端的本机监听端口。例如本机 mixed 端口为 `42685`，用 `curl.exe --proxy socks5h://127.0.0.1:42685 https://api64.ipify.org` 验证。该本机端口、A 入口端口、B 代理端口是三个独立值。本工具不改本地 DNS 或系统代理，分流和 TUN 需在本地客户端单独配置。
 
 返回值应与 **B 自己访问相同目标、相同地址族时的出口**一致。B 可能有 NAT、多个 IP 或自己的上游代理，因此不一定等于 SSH 登录地址。再测试下载和实际应用，验证认证、DNS、TLS 均正常。
 
@@ -182,8 +175,6 @@ sudo journalctl -u a2b-forward-rules -u a2b-forward-proxy -n 60 --no-pager
 
 每次写入会保存权限受限的备份至 `/var/lib/a2b-forward/backups/`，记录至 `/var/lib/a2b-forward/audit.tsv`。正常应用错误、输入中断会触发本次操作的自动回滚。包安装、断电、SIGKILL 和磁盘损坏不在即时回滚保证范围内。备份可能含 WireGuard 私钥，勿公开。
 
-变更操作另有 `/var/log/a2b-forward/operation-*.log`，权限为 `600`；查看/诊断不会新建操作日志。按需归档旧日志和备份，勿直接上传。NAT/Nginx 先检查完整候选配置；校验或重载命令失败时恢复旧文件，尽量不重启原 Nginx 进程。回滚覆盖本次改动，不是全主机网络的跨表原子事务。
-
 旧版整份防火墙持久化会迁移为专属链，并从旧 `rules.v4/v6` 文件去除 A2B 条目，保留其它规则。建议升级后主动运行一次恢复验证，再选择维护窗口重启实机确认。
 
 ## 连不上时，按顺序检查
@@ -204,10 +195,9 @@ sudo journalctl -u a2b-forward-rules -u a2b-forward-proxy -n 60 --no-pager
 - 同族转发使用内核 NAT；跨族使用独立的 Nginx stream，不解密代理协议。Nginx UDP 会话默认空闲 60 秒，可在向导中调整；持续传输会刷新超时。
 - B 已有加密代理时，直接转发少一层封装。需要 A-B 加密或私有地址时使用 WireGuard；它有封装开销，不能保证提高网速、降低丢包或降低时延。
 - 不再无条件放大全局缓冲区、缩短 TCP 回收时间或修改拥塞控制。这些参数并不等于 NAT 端口转发提速。调优应根据 CPU、连接跟踪占用、RTT、丢包和真实吞吐判断。
-- 可选容量设置默认关闭，仅提高过低的 conntrack 上限和监听队列，不降低已有较高值。可用内存低于 512 MiB 时跳过；门槛不是内存不会耗尽的保证。已开启的容量配置会保留，旧版缓冲区/TCP 回收调优文件则迁出，运行值不臆测恢复。
 - systemd 常驻和进程恢复不等于多机高可用。本版本没有多个 B 的自动故障切换、负载均衡或掉线后的会话迁移。
 - 自动测试覆盖 Ubuntu 22.04/24.04 的地址解析、交互、真实 TCP/UDP、NAT、Nginx、链式 SOCKS5 出口、WireGuard、规则恢复和服务故障恢复。CI 不替代你所在公网线路的长期压测和实机重启验证。
 
-完整复核发现、测试边界和操作留痕见 [AUDIT.md](AUDIT.md)；同日另一轮复核及资源事件原始记录保留在 [历史审计](docs/REVIEW-20260906.md)，其中路径和测试范围以当时版本为准。
+完整复核发现、测试边界和操作留痕见 [AUDIT.md](AUDIT.md)。
 
 测试只应在一次性 CI/测试 VM 运行。完整集成套件要求至少 1 GiB 可用内存，测试 Nginx 限为一个 worker，并设有超时和退出清理；network namespace 只隔离网络，不隔离宿主机内存。复现命令见审计，勿在承担业务的小内存 VPS 上压测。

@@ -118,7 +118,7 @@ udp fd00:a2b:1::2 18080
 pass 'NAT44/NAT66 TCP and multi-datagram UDP with return-path SNAT'
 
 # 从主菜单走完新手路径，包含默认网卡选择、目标 socket 解析、探测和最终确认。
-printf '%s\n' 1 1 y 1 1 3 1 18086 10.203.2.2:18081 '' '' '' '' 10.203.0.2/32 n y |
+printf '%s\n' 1 1 y 1 1 3 1 18086 10.203.2.2:18081 '' '' '' '' 10.203.0.2/32 y |
     run a 'prepare_changes() { :; }; main_menu'
 expect "$(get http://10.203.1.2:18086)" B
 pass 'complete beginner menu to a working mapping using detected interface/address defaults'

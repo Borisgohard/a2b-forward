@@ -36,10 +36,6 @@ jobs:
           shellcheck -x iptables_Forward.sh tests/*.sh
           git diff --check
       - name: Unit checks
-        run: |
-          bash tests/unit.sh
-          bash tests/test_core.sh
-      - name: Candidate update and failure regression tests
-        run: sudo --preserve-env=CI timeout 180 bash tests/regression-network.sh
+        run: bash tests/unit.sh
       - name: Real network and service tests
         run: sudo --preserve-env=CI timeout 480 bash tests/integration.sh

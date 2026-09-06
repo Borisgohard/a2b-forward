@@ -19,8 +19,6 @@ PROXY_CONF_DIR="${PROXY_DIR}/conf.d"
 PROXY_CONF="${PROXY_DIR}/nginx.conf"
 PROXY_SERVICE="/etc/systemd/system/a2b-forward-proxy.service"
 PROXY_PID="/run/a2b-forward-nginx.pid"
-PROXY_LOG_DIR="/var/log/a2b-forward"
-NGINX_STREAM_MODULE="/usr/lib/nginx/modules/ngx_stream_module.so"
 NGINX_WORKERS=auto
 WG_DIR="/etc/wireguard"
 WG_EXPORT_DIR="/root/a2b-forward-wireguard"
@@ -33,8 +31,6 @@ SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 INSTALLED_SCRIPT="/usr/local/lib/a2b-forward/iptables_Forward.sh"
 STATE_DIR="/var/lib/a2b-forward"
 TRANSACTION_DIR=""
-TRANSACTION_PROXY_CHANGED=0
-APPLY_CAPACITY_TUNING=0
 UDP_TIMEOUT=60
 
 die() {
@@ -89,7 +85,7 @@ need_systemd() {
 install_proxy_dependencies() {
     local install_status=0
     if command -v nginx >/dev/null 2>&1; then
-        if [[ ! -f "$NGINX_STREAM_MODULE" ]] && command -v apt-get >/dev/null 2>&1; then
+        if [[ ! -f /usr/lib/nginx/modules/ngx_stream_module.so ]] && command -v apt-get >/dev/null 2>&1; then
             export DEBIAN_FRONTEND=noninteractive
             apt-get update
             apt-get install -y libnginx-mod-stream || warn "libnginx-mod-stream 安装失败；如果 nginx 已内置 stream 模块，可忽略。"
@@ -136,10 +132,6 @@ install_wireguard_dependencies() {
 validate_port() {
     local port="$1"
     [[ "$port" =~ ^[0-9]{1,5}$ ]] && (( 10#$port >= 1 && 10#$port <= 65535 ))
-}
-
-validate_interface_name() {
-    [[ "$1" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,14}$ ]]
 }
 
 # read 在命令替换中遇到 EOF 也必须退出，不能默默采用默认选项。
@@ -366,7 +358,6 @@ get_iface_address() {
 backup_rules() {
     local path index=0 unit
     [[ -z "$TRANSACTION_DIR" ]] || die "已有未完成的配置事务。"
-    TRANSACTION_PROXY_CHANGED=0
     mkdir -p "$STATE_DIR/backups"
     chmod 700 "$STATE_DIR" "$STATE_DIR/backups"
     TRANSACTION_DIR="$(mktemp -d "$STATE_DIR/backups/$(date +%Y%m%d-%H%M%S)-XXXXXX")"
@@ -380,7 +371,7 @@ backup_rules() {
         [[ ! -e "$path" ]] || cp -a -- "$path" "$TRANSACTION_DIR/$index"
         index=$((index + 1))
     done
-    sysctl -a 2>/dev/null | awk '(/^net\.(ipv4|ipv6)\./ && /\.(ip_forward|forwarding|accept_ra|rp_filter) = /) || /^net\.(netfilter.nf_conntrack_max|core.somaxconn) = /' > "$TRANSACTION_DIR/sysctl" || true
+    sysctl -a 2>/dev/null | awk '/^net\.(ipv4|ipv6)\./ && /\.(ip_forward|forwarding|accept_ra|rp_filter) = /' > "$TRANSACTION_DIR/sysctl" || true
     for unit in a2b-forward-proxy.service a2b-forward-rules.service ${TRANSACTION_WG_UNIT:-}; do
         printf '%s\t%s\t%s\n' "$unit" "$(systemctl is-active "$unit" 2>/dev/null || true)" \
             "$(systemctl is-enabled "$unit" 2>/dev/null || true)" >> "$TRANSACTION_DIR/services.tsv"
@@ -423,14 +414,7 @@ rollback_transaction() {
     while IFS=$'\t' read -r unit active enabled; do
         [[ "$enabled" != enabled ]] || systemctl enable "$unit" >/dev/null 2>&1 || failed=1
         if [[ "$active" == active && "$unit" != a2b-forward-rules.service ]]; then
-            if [[ "$unit" == a2b-forward-proxy.service ]]; then
-                # 候选校验失败时不扰动原进程；已切换的配置优先优雅重载回来。
-                if (( TRANSACTION_PROXY_CHANGED )); then
-                    systemctl reload "$unit" || systemctl restart "$unit" || failed=1
-                fi
-            else
-                systemctl restart "$unit" || failed=1
-            fi
+            systemctl restart "$unit" || failed=1
         fi
     done < "$TRANSACTION_DIR/services.tsv"
     printf '%s\trollback=%s\t%s\n' "$(date -Is)" "$failed" "$TRANSACTION_DIR" >> "$STATE_DIR/audit.tsv"
@@ -516,31 +500,6 @@ configure_sysctl() {
     fi
 }
 
-configure_performance_tuning() {
-    local available current
-    local settings=()
-    available="$(awk '/^MemAvailable:/ {print $2}' /proc/meminfo)"
-    if [[ ! "$available" =~ ^[0-9]+$ ]] || (( available < 524288 )); then
-        warn "可用内存不足 512 MiB，跳过扩大连接容量；增加上限可能导致内存压力。"
-        return
-    fi
-    current="$(sysctl -n net.netfilter.nf_conntrack_max 2>/dev/null || true)"
-    if [[ "$current" =~ ^[0-9]+$ ]] && (( current < 262144 )); then
-        settings+=("net.netfilter.nf_conntrack_max=262144")
-    fi
-    current="$(sysctl -n net.core.somaxconn 2>/dev/null || true)"
-    if [[ "$current" =~ ^[0-9]+$ ]] && (( current < 65535 )); then
-        settings+=("net.core.somaxconn=65535")
-    fi
-    if (( ${#settings[@]} )); then
-        write_sysctl_file "$SYSCTL_PERF_FILE" "${settings[@]}"
-        apply_sysctl_file "$SYSCTL_PERF_FILE"
-        info "已提高过低的连接容量上限；这不是带宽或时延提升保证，请监控内存与实际连接数。"
-    else
-        info "当前连接容量已满足预设上限，未改动。"
-    fi
-}
-
 ensure_chain() {
     local cmd="$1"
 
@@ -576,17 +535,6 @@ ensure_rule_append() {
     local table="$2"
     local chain="$3"
     shift 3
-
-    if [[ -n "${RULE_STAGE:-}" ]]; then
-        python3 - "$RULE_STAGE" "$table" "$chain" "$@" <<'PY'
-import json
-import sys
-path, table, chain, *args = sys.argv[1:]
-with open(path, "a", encoding="utf-8") as out:
-    out.write(table + "\t-A " + chain + " " + " ".join(json.dumps(x) for x in args) + "\n")
-PY
-        return
-    fi
 
     if [[ "$table" == "filter" ]]; then
         if ! "$cmd" -w -C "$chain" "$@" 2>/dev/null; then
@@ -715,7 +663,7 @@ write_rules_restore_service() {
     cat > "$RULES_RESTORE_SERVICE" <<EOF
 [Unit]
 Description=A2B forwarding firewall rules restore
-After=network-online.target ufw.service netfilter-persistent.service docker.service
+After=network-online.target ufw.service netfilter-persistent.service
 Wants=network-online.target
 
 [Service]
@@ -748,22 +696,19 @@ save_rules() {
     info "A2B 规则已保存并启用开机恢复。当前内核规则已生效，恢复服务首次运行可在重启后显示 active (exited)。"
 }
 
-write_mapping_candidate() {
-    python3 - "$1" "$2" "$LOCAL_PORT" "$3" "${4:-}" <<'PY'
+remove_mapping_rules() {
+    local cmd="$1" family="$2" protocols="$3" tmp
+    tmp="$(mktemp)"
+    export_managed_rules "$cmd" > "$tmp"
+    python3 - "$tmp" "$family" "$LOCAL_PORT" "$protocols" <<'PY'
 import pathlib
 import shlex
 import sys
 
-path, family, port, protocols, additions = sys.argv[1:]
-new = {"nat": [], "filter": []}
-if additions:
-    for line in pathlib.Path(additions).read_text().splitlines():
-        table, rule = line.split("\t", 1)
-        new[table].append(rule)
-table = None
-for line in pathlib.Path(path).read_text().splitlines():
-    if line.startswith("*"):
-        table = line[1:]
+path, family, port, protocols = sys.argv[1:]
+file = pathlib.Path(path)
+result = []
+for line in file.read_text().splitlines():
     words = shlex.split(line)
     comment = words[words.index("--comment") + 1] if "--comment" in words else ""
     remove = any(comment == f"a2b-forward map-{family}-{proto}-{port}"
@@ -771,20 +716,11 @@ for line in pathlib.Path(path).read_text().splitlines():
                  or comment == f"a2b-forward proxy listen {proto} {port}"
                  for proto in protocols.split())
     if not remove:
-        if line == "COMMIT":
-            for rule in new[table]:
-                print(rule)
-        print(line)
+        result.append(line)
+file.write_text("\n".join(result) + "\n")
 PY
-}
-
-remove_mapping_rules() {
-    local cmd="$1" family="$2" protocols="$3" tmp
-    tmp="$(mktemp)"
-    export_managed_rules "$cmd" > "$tmp.before"
-    write_mapping_candidate "$tmp.before" "$family" "$protocols" > "$tmp"
     restore_family_rules "$cmd" "$tmp"
-    rm -f "$tmp" "$tmp.before"
+    rm -f "$tmp"
 }
 
 remove_mapping_proxy_files() {
@@ -1163,10 +1099,6 @@ confirm_config() {
     fi
 
     echo "同入口协议族、端口和 TCP/UDP 的已有映射会被替换；未选择的协议保持原样。已有 NAT 连接沿用旧 conntrack；跨引擎切换可能中断旧代理连接，请重连客户端。"
-    APPLY_CAPACITY_TUNING=0
-    if confirm_yes_no "是否提高过低的连接容量上限？普通转发选 N；高并发会增加内存需求，不保证提速" N; then # 交互: 可选容量调优默认关闭，并在最终写入确认前告知代价。
-        APPLY_CAPACITY_TUNING=1
-    fi
     confirm_yes_no "确认写入配置" Y || die "已取消。" # 交互: 展示完整参数和更新范围后才写入。
 }
 
@@ -1182,13 +1114,7 @@ add_nat_rules() {
     local fwd_new_args
     local fwd_reply_args
 
-    local stage before candidate
-    stage="$(mktemp -d)"
-    before="$stage/before"
-    candidate="$stage/candidate"
-    local RULE_STAGE="$stage/new"
-    : > "$RULE_STAGE"
-    export_managed_rules "$cmd" > "$before"
+    ensure_chain "$cmd"
 
     if [[ "$family" == "6" ]]; then
         dnat_target="[${TARGET_IP}]:${TARGET_PORT}"
@@ -1222,18 +1148,6 @@ add_nat_rules() {
             -m conntrack --ctstate RELATED --ctorigdstport "$LOCAL_PORT" \
             -m comment --comment "$comment" -j ACCEPT
     done
-    write_mapping_candidate "$before" "$family" "$protocols" "$RULE_STAGE" > "$candidate"
-    if ! "$cmd-restore" --wait 10 --noflush --test < "$candidate"; then
-        rm -r -- "$stage"
-        die "NAT 候选规则校验失败，原规则未改动。"
-    fi
-    if ! "$cmd-restore" --wait 10 --noflush < "$candidate"; then
-        "$cmd-restore" --wait 10 --noflush < "$before" || warn "原 A2B 链恢复失败，请检查事务备份。"
-        rm -r -- "$stage"
-        die "NAT 写入失败，已尝试恢复原规则。"
-    fi
-    ensure_chain "$cmd"
-    rm -r -- "$stage"
 }
 
 nginx_addr_port() {
@@ -1283,8 +1197,8 @@ write_proxy_master_config() {
     mkdir -p "$PROXY_DIR" "$PROXY_CONF_DIR"
 
     {
-        if [[ -f "$NGINX_STREAM_MODULE" ]]; then
-            echo "load_module ${NGINX_STREAM_MODULE};"
+        if [[ -f /usr/lib/nginx/modules/ngx_stream_module.so ]]; then
+            echo "load_module /usr/lib/nginx/modules/ngx_stream_module.so;"
             echo
         fi
         cat <<EOF
@@ -1343,21 +1257,9 @@ write_proxy_mapping() {
     local name
     local conf_file
     local listen_line
-    local live_dir="$PROXY_CONF_DIR" live_master="$PROXY_CONF" stage
-    local was_active=false applied=false
 
-    mkdir -p "$PROXY_DIR"
-    stage="$(mktemp -d "${PROXY_DIR}/.candidate.XXXXXX")"
-    mkdir -p "$stage/conf.d" "$stage/old"
-    if [[ -d "$live_dir" ]]; then
-        cp -a "$live_dir/." "$stage/conf.d/"
-        cp -a "$live_dir/." "$stage/old/"
-    fi
-    [[ ! -f "$live_master" ]] || cp -p "$live_master" "$stage/old-master"
-    [[ ! -f "$PROXY_SERVICE" ]] || cp -p "$PROXY_SERVICE" "$stage/old-service"
-    local PROXY_CONF_DIR="$stage/conf.d" PROXY_CONF="$stage/nginx.conf"
-    remove_mapping_proxy_files "$listen_family" "$protocols"
     write_proxy_master_config
+    write_proxy_service
 
     listen_socket="$(nginx_addr_port "$listen_family" "$LISTEN_ADDR" "$LOCAL_PORT")"
     target_socket="$(nginx_proxy_pass_target "$target_family" "$TARGET_IP" "$TARGET_PORT")"
@@ -1397,43 +1299,19 @@ write_proxy_mapping() {
     done
 
     if ! nginx -t -c "$PROXY_CONF"; then
-        rm -r -- "$stage"
-        die "Nginx 候选配置校验失败，现有配置和进程保持不变。请检查 stream 模块与日志。"
+        die "Nginx stream 配置测试失败。请确认 nginx 已安装 stream 模块，且监听端口未被其它程序占用。"
     fi
 
     if ! command -v systemctl >/dev/null 2>&1; then
-        rm -r -- "$stage"
         die "跨协议族代理需要 systemd 托管高可用服务，但当前系统没有 systemctl。"
     fi
 
-    PROXY_CONF_DIR="$live_dir"
-    PROXY_CONF="$live_master"
-    mkdir -p "$live_dir"
-    remove_mapping_proxy_files "$listen_family" "$protocols"
-    cp -a "$stage/conf.d/." "$live_dir/"
-    write_proxy_master_config
-    write_proxy_service
     systemctl daemon-reload
     if systemctl is-active --quiet a2b-forward-proxy.service; then
-        was_active=true
-        if systemctl reload a2b-forward-proxy.service; then applied=true; fi
+        systemctl reload a2b-forward-proxy.service
     else
-        if systemctl enable --now a2b-forward-proxy.service; then applied=true; fi
+        systemctl enable --now a2b-forward-proxy.service
     fi
-    if [[ "$applied" != true ]]; then
-        rm -r -- "$live_dir"
-        mkdir -p "$live_dir"
-        cp -a "$stage/old/." "$live_dir/"
-        if [[ -f "$stage/old-master" ]]; then cp -p "$stage/old-master" "$live_master"; else rm -f "$live_master"; fi
-        if [[ -f "$stage/old-service" ]]; then cp -p "$stage/old-service" "$PROXY_SERVICE"; else rm -f "$PROXY_SERVICE"; fi
-        if [[ "$was_active" != true ]]; then systemctl disable --now a2b-forward-proxy.service || true; fi
-        systemctl daemon-reload
-        rm -r -- "$stage"
-        die "Nginx 服务应用失败，已恢复旧配置；未强制重启原服务。"
-    fi
-    TRANSACTION_PROXY_CHANGED=1
-    rm -r -- "$stage"
-    systemctl enable a2b-forward-proxy.service >/dev/null
     systemctl is-active --quiet a2b-forward-proxy.service || die "代理服务未运行。"
     wait_proxy_ready "$listen_family" "$protocols"
     info "跨协议族代理服务已启用: a2b-forward-proxy.service"
@@ -1441,7 +1319,6 @@ write_proxy_mapping() {
 
 remove_proxy_config() {
     if command -v systemctl >/dev/null 2>&1 && [[ -f "$PROXY_SERVICE" ]]; then
-        TRANSACTION_PROXY_CHANGED=1
         systemctl disable --now a2b-forward-proxy.service >/dev/null 2>&1 || true
     fi
 
@@ -1476,7 +1353,7 @@ remove_wireguard_config() {
     for file in "${WG_EXPORT_DIR}"/*-B.conf; do
         base="$(basename "$file")"
         iface="${base%-B.conf}"
-        validate_interface_name "$iface" || die "异常接口名，停止删除: $iface"
+        [[ "$iface" =~ ^[A-Za-z][A-Za-z0-9_-]{0,14}$ ]] || die "异常接口名，停止删除: $iface"
         TRANSACTION_WG_UNIT="wg-quick@${iface}.service"
         backup_rules "${WG_DIR}/${iface}.conf" "$file"
         if command -v systemctl >/dev/null 2>&1; then
@@ -1647,7 +1524,7 @@ create_wireguard_tunnel() {
     install_wireguard_dependencies
 
     iface="$(prompt_default "WireGuard 接口名" "a2b0")" # 交互: 设置 A/B 两端 WireGuard 接口名。
-    validate_interface_name "$iface" || die "接口名须以字母/数字/下划线开头，最多 15 个字母、数字、下划线、点或短横线。"
+    [[ "$iface" =~ ^[A-Za-z][A-Za-z0-9_-]{0,14}$ ]] || die "接口名须以字母开头，最多 15 个字母/数字/下划线/短横线。"
     [[ ! -e "$WG_DIR/$iface.conf" && ! -e "$WG_EXPORT_DIR/$iface-B.conf" ]] ||
         die "接口配置已存在。请使用已有 WireGuard 模式，或输入新接口名；覆盖密钥会断开 B。"
     if ip link show dev "$iface" >/dev/null 2>&1; then
@@ -1688,7 +1565,7 @@ create_wireguard_tunnel() {
     b_conf="${WG_EXPORT_DIR}/${iface}-B.conf"
     echo "将新建 $iface，A 监听 UDP $listen_port；B 必须能访问 $a_endpoint。"
     echo "A 隧道: $a_ipv4_cidr / $a_ipv6_cidr；B 隧道: $b_ipv4_cidr / $b_ipv6_cidr；MTU: $mtu"
-    confirm_yes_no "确认生成密钥、写入并启动 A 端 WireGuard" N || die "已取消。" # 交互: 所有参数显示后才创建接口，默认不写入。
+    confirm_yes_no "确认生成密钥、写入并启动 A 端 WireGuard" Y || die "已取消。" # 交互: 所有参数显示后才创建接口。
     TRANSACTION_WG_UNIT="wg-quick@${iface}.service"
     backup_rules "$a_conf" "$b_conf"
 
@@ -1749,11 +1626,6 @@ EOF
 
     WG_B_IPV4="$b_ipv4"
     WG_B_IPV6="$b_ipv6"
-    # 保留 source 调用方可读取的生成结果，不输出私钥。
-    # shellcheck disable=SC2034
-    WG_IFACE="$iface"
-    # shellcheck disable=SC2034
-    WG_B_CONFIG="$b_conf"
 
     echo
     echo "WireGuard A 端已配置并尝试启动: ${a_conf}"
@@ -1836,25 +1708,24 @@ apply_current_mapping() {
     backup_rules
     cmd="iptables"
     [[ "$listen_family" != 6 ]] || cmd="ip6tables"
+    remove_mapping_rules "$cmd" "$listen_family" "$protocols"
+    remove_mapping_proxy_files "$listen_family" "$protocols"
     # 停止重写全局缓冲区/连接回收值；旧版文件移除，运行值不臆测复原。
-    if [[ -f "$SYSCTL_PERF_FILE" ]] && grep -Eq '(rmem|wmem|tcp_)' "$SYSCTL_PERF_FILE"; then
+    if [[ -f "$SYSCTL_PERF_FILE" ]]; then
         rm -f "$SYSCTL_PERF_FILE"
         info "已移除旧版通用性能 sysctl 文件；当前运行值保留，避免覆盖其它调优。"
     fi
-    (( APPLY_CAPACITY_TUNING == 0 )) || configure_performance_tuning
 
     if [[ "$engine" == "nat" ]]; then
         cmd="iptables"
         [[ "$target_family" == "6" ]] && cmd="ip6tables"
         configure_sysctl "$target_family"
         add_nat_rules "$target_family" "$cmd" "$protocols"
-        remove_mapping_proxy_files "$listen_family" "$protocols"
         if [[ -f "$PROXY_CONF" ]]; then
             if compgen -G "$PROXY_CONF_DIR/*.conf" >/dev/null; then
                 nginx -t -c "$PROXY_CONF"
                 if systemctl is-active --quiet a2b-forward-proxy.service; then
                     systemctl reload a2b-forward-proxy.service
-                    TRANSACTION_PROXY_CHANGED=1
                 fi
             else
                 remove_proxy_config
@@ -1863,7 +1734,6 @@ apply_current_mapping() {
         save_rules
     else
         write_proxy_mapping "$listen_family" "$target_family" "$protocols"
-        remove_mapping_rules "$cmd" "$listen_family" "$protocols"
         allow_proxy_input "$listen_family" "$protocols"
         save_rules
     fi
@@ -2095,16 +1965,8 @@ acquire_lock() {
 }
 
 prepare_changes() {
-    local audit_log
     need_systemd
     acquire_lock
-    mkdir -p "$PROXY_LOG_DIR"
-    chmod 700 "$PROXY_LOG_DIR"
-    audit_log="$PROXY_LOG_DIR/operation-$(date +%Y%m%d-%H%M%S)-$$.log"
-    touch "$audit_log"
-    chmod 600 "$audit_log"
-    exec > >(tee -a "$audit_log") 2>&1
-    info "本次操作日志: $audit_log（不输出密码/私钥；请按需归档或清理旧日志）"
     install_base_dependencies
 }
 
