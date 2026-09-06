@@ -36,6 +36,7 @@ sing-box version
 生成随机密钥：
 
 ```bash
+umask 077
 sing-box generate rand --base64 16
 ```
 

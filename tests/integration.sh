@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
 # Requires root on a disposable Linux test machine. No public test ports are opened.
 set -Eeuo pipefail
+[[ "${CI:-}" == true || "${A2B_TEST_DISPOSABLE:-}" == yes ]] || {
+    echo 'Use disposable CI/VM only; explicitly set A2B_TEST_DISPOSABLE=yes on a test VM.' >&2
+    exit 1
+}
+available_kb="$(awk '/^MemAvailable:/ {print $2}' /proc/meminfo)"
+(( available_kb >= 1048576 )) || { echo 'Full integration suite needs at least 1 GiB available RAM.' >&2; exit 1; }
 export A2B_REPO
 A2B_REPO="$(cd "$(dirname "$0")/.." && pwd)"
 export A2B_TEST_ROOT
@@ -27,6 +33,8 @@ cleanup() {
     rm -rf -- "$A2B_TEST_ROOT"
 }
 trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM HUP
 trap 'printf "FAIL integration line %s\n" "$LINENO" >&2' ERR
 
 run() {

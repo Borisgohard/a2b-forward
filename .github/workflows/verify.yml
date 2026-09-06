@@ -38,4 +38,4 @@ jobs:
       - name: Unit checks
         run: bash tests/unit.sh
       - name: Real network and service tests
-        run: sudo --preserve-env=CI bash tests/integration.sh
+        run: sudo --preserve-env=CI timeout 480 bash tests/integration.sh

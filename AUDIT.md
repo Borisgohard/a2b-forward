@@ -2,7 +2,7 @@
 
 ## 2026-09-06 复核
 
-基线：`d6ddacd`。工作目录：`Y:\Forward`。本次授权范围：重新 code review、修复并验证、完善交互和新手文档、推送 `Borisgohard/a2b-forward`。使用临时分支 `codex/review-reliability` 执行 Linux CI，完成验收后快进主分支。GitHub 网络访问使用命令级 `127.0.0.1:42343` 代理。
+基线：`d6ddacd`。本记录只描述 Linux 转发工具的功能、验证与限制，不提供本地客户端配置或生产服务器部署记录。新手安装步骤见 [README](README.md) 和 [完整示例](docs/BEGINNER.md)。
 
 ### 确认的问题与处理
 
@@ -22,30 +22,38 @@
 | P2 | 通用大缓冲区、缩短 TCP 回收时间被当作无条件提速 | 停止这些全局参数改写；保留内核 NAT 和 Nginx 事件驱动路径；用有限吞吐测试记录结果 |
 | P2 | WireGuard 被描述为自动跨族/改善网络质量；双栈中转步骤不完整 | 说明底层可达前提；支持保留 A 并经 R 转发；区分服务常驻与多机故障切换 |
 
-### 验证记录
+### 验证范围
 
-- 本地 Git Bash 语法检查、ShellCheck 0.11.0、59 项输入与逻辑检查通过。
-- 已添加 Ubuntu 22.04 / 24.04 CI：内核 NAT、Nginx 跨族 TCP/UDP、两跳、实际 SOCKS5 出口、WireGuard、持久化、故障恢复、有限吞吐对照。
-- Linux CI 的最终结果在本次发布完成前补录。不能将历史 VPS 测试视为本次版本验证。
+- 本地 Git Bash 语法检查、ShellCheck 0.11.0、`git diff --check` 通过；保留的 `tests/unit.sh` 共 63 项通过。
+- Linux 验证由 [Verify 工作流](https://github.com/Borisgohard/a2b-forward/actions/workflows/verify.yml) 在 Ubuntu 22.04 与 24.04 执行。请按具体提交查询完整结果，不将一个旧版本的通过视为所有后续版本的证明。
+- 真实路径覆盖：NAT44/NAT66 TCP 与多报文 UDP、Nginx46/64、来源限制及更新、TCP 更新保留 UDP、Nginx/NAT 来回切换、完整中文向导、两跳 SOCKS5 的 B 出口、sing-box 1.14.0 加密代理模板、生成的 WireGuard 双栈隧道与 B 出口、保留隧道的卸载、无目标族路由拒绝、规则恢复和真实 systemd 进程故障恢复。
+- 配置故障注入检查文件、规则与原流量的事务恢复；回滚可能重启原 Nginx 服务，并不保证原进程或已有连接不中断。发行版默认 HTTP Nginx 服务在安装转发依赖后保持 inactive。
+- 早期测试发现并修正了测试替身的服务状态输出、Ubuntu 22.04 的 `systemctl --kill-who` 参数兼容、Nginx 优雅退出 worker 暂持监听的冲突判定。失败运行未作为通过证据。
+- 发布检查覆盖 Git 文件边界、私钥/令牌模式及匿名下载一致性。模式扫描不是不存在所有形式秘密的数学证明。
+- 集成测试的 iperf3 每项请求 2 秒，环境为同一 VM 的 veth。样本只用于确认持续传输与记录波动，不是公网测速、新旧版本性能对比或吞吐保证。
 
 ### 影响与边界
 
-- 未连接或改动历史 VPS；本次真实网络实验使用一次性 CI VM 中的隔离命名空间，不开放公网测试代理。
+- 真实网络实验使用一次性 CI VM 中的隔离命名空间，不开放公网测试代理，也不代表已部署到生产 VPS。
 - 包管理器安装的依赖不在配置回滚范围内；回滚恢复本次保存的配置、运行规则及相关 sysctl。
 - 正常错误、INT/TERM 可触发回滚；SIGKILL、断电、磁盘损坏不保证即时回滚。
 - 更新保留已有 conntrack 连接；新连接才使用新目标与来源规则。
+- 连续切换 Nginx/NAT 后，监听归属预检曾出现一次端口占用失败，同一提交的其他运行及单次重跑通过。异步进程退出存在时序风险，不能以重跑通过宣称已排除；实际操作应先检查监听状态。
 - 未部署公网 NAT64/464XLAT 网关，地址合成通过不代表运营商具有转换能力。
 - CI 吞吐只反映同机虚拟网络的短时结果；公网带宽、时延、丢包、MTU、云安全组和长期稳定性需部署后测量。
 - 本地 `.local/`、`.tools/` 已忽略，Git 凭据仅经系统凭据助手在内存中使用，不写入公开文件。
+- 测试网络命名空间不提供内存隔离。保留的完整测试要求一次性 CI/VM 与至少 1 GiB 可用内存。Nginx 测试固定单 worker，CI 限制 480 秒并在退出/信号时清理。生产部署的 Nginx 仍按 CPU 自动创建 worker，需要按 VPS 资源做容量规划。
 
-### 复现
+### 当前版本复现
 
 ```bash
 bash tests/unit.sh
 shellcheck -x iptables_Forward.sh tests/*.sh
 # 仅在可丢弃的 Linux 测试机执行，需安装 workflow 中的依赖：
-sudo bash tests/integration.sh
+sudo env A2B_TEST_DISPOSABLE=yes timeout 480 bash tests/integration.sh
 ```
+
+真实 systemd 生命周期部分仅在一次性 CI VM (`CI=true`) 运行；普通手动运行会明确跳过该项。不能在业务机器上设置 `CI=true` 来强行开启它。
 
 ### 设计依据
 

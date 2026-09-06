@@ -19,6 +19,7 @@ PROXY_CONF_DIR="${PROXY_DIR}/conf.d"
 PROXY_CONF="${PROXY_DIR}/nginx.conf"
 PROXY_SERVICE="/etc/systemd/system/a2b-forward-proxy.service"
 PROXY_PID="/run/a2b-forward-nginx.pid"
+NGINX_WORKERS=auto
 WG_DIR="/etc/wireguard"
 WG_EXPORT_DIR="/root/a2b-forward-wireguard"
 RULES_V4_FILE="/etc/iptables/a2b-rules.v4"
@@ -966,7 +967,7 @@ collect_common_config() {
         fi
         [[ -n "$SNAT_SOURCE" ]] || die "无法自动获取 ${ENTRY_NODE_LABEL} 连接 ${TARGET_NODE_LABEL} 时使用的源 IP。请检查 ${EGRESS_IF} 的地址配置。"
 
-        SNAT_SOURCE="$(prompt_default "${ENTRY_NODE_LABEL} 转发到 ${TARGET_NODE_LABEL} 时使用的源 IP(SNAT，高性能推荐默认值)" "$SNAT_SOURCE")" # 交互: 设置 SNAT 源地址，保证下一跳机器回包回到当前入口机器。
+        SNAT_SOURCE="$(prompt_default "${ENTRY_NODE_LABEL} 转发到 ${TARGET_NODE_LABEL} 时使用的源 IP(SNAT，确认默认值属于出口网卡)" "$SNAT_SOURCE")" # 交互: 设置 SNAT 源地址，使下一跳回包经过当前入口机器。
         SNAT_SOURCE="$(normalize_ip "$SNAT_SOURCE")"
         SNAT_SOURCE="$(ip_value address "$SNAT_SOURCE" "$target_family")" || die "SNAT 地址无效。"
         iface_has_address "$target_family" "$EGRESS_IF" "$SNAT_SOURCE" || die "SNAT 地址不属于所选出口网卡。"
@@ -1201,7 +1202,7 @@ write_proxy_master_config() {
             echo
         fi
         cat <<EOF
-worker_processes auto;
+worker_processes ${NGINX_WORKERS};
 worker_rlimit_nofile 1048576;
 pid ${PROXY_PID};
 error_log stderr warn;
@@ -1439,7 +1440,7 @@ choose_entry_family() {
     echo "请选择你本地连接 ${ENTRY_NODE_LABEL} 使用的入口协议:" >&2
     echo "1. IPv4  本地客户端访问 ${ENTRY_NODE_LABEL} 的 IPv4 地址。" >&2
     echo "2. IPv6  本地客户端访问 ${ENTRY_NODE_LABEL} 的 IPv6 地址。" >&2
-    echo "提示: 想要最高性能，请让入口协议族和 ${TARGET_NODE_LABEL} 的目标地址协议族一致，这样可走内核 NAT。" >&2
+    echo "提示: 入口和 ${TARGET_NODE_LABEL} 目标使用同一协议族时可走内核 NAT，减少用户态转发；实际性能仍取决于线路。" >&2
     choice="$(prompt_choice "请输入选项" 1 "1 2 4 6")" # 交互: 选择当前入口机器对外暴露入口时使用 IPv4 还是 IPv6。
 
     case "${choice:-1}" in
@@ -1827,7 +1828,7 @@ add_b_proxy_workflow() {
         engine="nat"
     else
         engine="proxy"
-        warn "入口 IPv${listen_family} 到 B 目标 IPv${target_family} 属于跨协议族，无法使用内核 DNAT，将使用 Nginx stream L4 代理。若追求最高性能，建议给 WireGuard 同时配置与入口一致的 B 隧道地址。"
+        warn "入口 IPv${listen_family} 到 B 目标 IPv${target_family} 属于跨协议族，将使用 Nginx stream L4 代理。需要减少用户态转发时，可选用与入口同族的 B WireGuard 隧道地址；请以实测决定。"
     fi
 
     collect_common_config "$listen_family" "$target_family" "$engine"
@@ -1852,8 +1853,8 @@ show_chain_deploy_guide() {
     echo
     echo "性能建议:"
     echo "  1. WireGuard 提供加密但不保证改善丢包或带宽；已有加密协议可直接转发。"
-    echo "  2. 每一跳尽量使用同协议族地址，这样脚本会使用内核 NAT，性能最好。"
-    echo "  3. 跨 IPv4/IPv6 的一跳会自动使用 Nginx stream L4 代理；这更通用，但性能略低于内核 NAT。"
+    echo "  2. 同协议族地址可使用内核 NAT，通常转发开销较小；应同时比较两条线路的质量。"
+    echo "  3. 跨 IPv4/IPv6 的一跳使用 Nginx stream L4 代理；它会终止两侧传输连接，吞吐需实测。"
     echo "  4. 每一跳都建议限制来源 CIDR，例如 A 只允许 C，C 只允许你的本地公网 IP。"
     echo
 }

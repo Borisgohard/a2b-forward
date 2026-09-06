@@ -199,3 +199,5 @@ sudo journalctl -u a2b-forward-rules -u a2b-forward-proxy -n 60 --no-pager
 - 自动测试覆盖 Ubuntu 22.04/24.04 的地址解析、交互、真实 TCP/UDP、NAT、Nginx、链式 SOCKS5 出口、WireGuard、规则恢复和服务故障恢复。CI 不替代你所在公网线路的长期压测和实机重启验证。
 
 完整复核发现、测试边界和操作留痕见 [AUDIT.md](AUDIT.md)。
+
+测试只应在一次性 CI/测试 VM 运行。完整集成套件要求至少 1 GiB 可用内存，测试 Nginx 限为一个 worker，并设有超时和退出清理；network namespace 只隔离网络，不隔离宿主机内存。复现命令见审计，勿在承担业务的小内存 VPS 上压测。
